@@ -1,0 +1,8 @@
+{
+  "profiles": {
+    "XexTools": {
+      "commandName": "Project",
+      "commandLineArgs": "\"D:\\DC3 Debug\\Gamepad\\Debug\\Gamepad.xex\" \"D:\\DC3 Debug\\Gamepad\\Debug\\Gamepad.exe\""
+    }
+  }
+}
