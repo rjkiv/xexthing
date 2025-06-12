@@ -54,6 +54,7 @@ class XexPE {
             if(section.Name == ".text") {
                 textSectionStart = (uint)section.PointerToRawData;
                 textSectionEnd = textSectionStart + (uint)section.SizeOfRawData;
+                Console.WriteLine($"Text virtual address: {section.VirtualAddress:X}");
             }
             Debug.Assert(peAdjusted.Count == section.PointerToRawData, "Unexpected PE size at this point!");
             List<byte> sectionBytes = new();
@@ -67,6 +68,17 @@ class XexPE {
         }
 
         exeBytes = peAdjusted.ToArray();
+    }
+
+    private void AddFunction(Function func) {
+        // make sure a function with the raw byte start idx isn't already in here
+        int index = functionBoundaries.BinarySearch(func, Comparer<Function>.Create((x, y) => x.rawByteArrayStart.CompareTo(y.rawByteArrayStart)));
+
+        if (index >= 0) return;
+        // if there's no such function, insert it according to the raw byte start address
+        // insert it in a sorted manner now so we don't have to keep re-sorting as we add batches of functions
+        index = ~index;
+        functionBoundaries.Insert(index, func);
     }
 
     private void FindSaveAndRestoreRegisterFuncs() {
@@ -92,8 +104,8 @@ class XexPE {
         for(int i = 14; i <= 31; i++, theSaveGPRIdx += 4) {
             Function saveFunc = new Function($"__savegprlr_{i}", true, (uint)theSaveGPRIdx, (uint)theSaveGPRIdx + 4, 0, 0);
             Function restoreFunc = new Function($"__restgprlr_{i}", true, (uint)theSaveGPRIdx + 0x48, (uint)theSaveGPRIdx + 0x4C, 0, 0);
-            functionBoundaries.Add(saveFunc);
-            functionBoundaries.Add(restoreFunc);
+            AddFunction(saveFunc);
+            AddFunction(restoreFunc);
         }
 
         int theSaveFPRIdx = -1;
@@ -113,18 +125,74 @@ class XexPE {
         for (int i = 14; i <= 31; i++, theSaveFPRIdx += 4) {
             Function saveFunc = new Function($"__savefpr_{i}", true, (uint)theSaveFPRIdx, (uint)theSaveFPRIdx + 4, 0, 0);
             Function restoreFunc = new Function($"__restfpr_{i}", true, (uint)theSaveFPRIdx + 0x48, (uint)theSaveFPRIdx + 0x4C, 0, 0);
-            functionBoundaries.Add(saveFunc);
-            functionBoundaries.Add(restoreFunc);
+            AddFunction(saveFunc);
+            AddFunction(restoreFunc);
+        }
+
+        // save gpr 14: offset in file: 0x6CBAE0, .text Virtual Address: 0x183600, .text ptr to raw data: 0x176000, ImageBase: 0x82000000
+        // target from the map: 0x82278b30
+    }
+
+    private void FindUnwinds() {
+        BEBinaryReader br = new BEBinaryReader(new MemoryStream(exeBytes));
+        br.BaseStream.Seek(textSectionStart, SeekOrigin.Begin);
+
+        // look for the pattern:
+        // subi r31, r12, X - if (instr & 0xFC1F8000) == 0x3F8C0000, this is subi r31, r12, X
+        // mfspr r12, LR - 7d8802a6
+        // ...
+        // mtspr LR, r12 - 7d8803a6
+        // blr - 4e800020
+
+        while (br.BaseStream.Position < br.BaseStream.Length) {
+            uint curInst = br.ReadUInt32();
+            // if the current inst is: subi r31, r12, XXXX
+            if((curInst & 0xFC1F8000) == 0x3F8C000) {
+                var curPos = br.BaseStream.Position;
+                uint mfsprCheck = br.ReadUInt32();
+                // if the next inst over is: mfspr r12, LR
+                if (mfsprCheck == 0x7D8802A6) {
+                    // if we've found both these insts in sequence, we've found an unwind
+                    Function unwindFunc = new Function();
+                    unwindFunc.rawByteArrayStart = (uint)curPos;
+                    unwindFunc.name = $"Unwind_{unwindFunc.rawByteArrayStart}";
+                    unwindFunc.analyzed = false;
+                    // read every subsequent inst until we find the combination of:
+                    // mtspr LR, r12, and blr
+                    while (br.ReadUInt32() != 0x7D8803A6) ;
+                    uint shouldBeBLR = br.ReadUInt32();
+                    Debug.Assert(shouldBeBLR == 0x4E800020);
+                    unwindFunc.rawByteArrayEnd = (uint)br.BaseStream.Position;
+                    unwindFunc.addressStart = unwindFunc.addressEnd = 0;
+                    AddFunction(unwindFunc);
+                }
+                else {
+                    // this wasn't an unwind, takesies backsies on the stream position then
+                    br.BaseStream.Seek(curPos, SeekOrigin.Begin);
+                }
+            }
         }
     }
 
     public void FindFunctionBoundaries() {
         // initial sweep to find and label the save/restore reg funcs
         FindSaveAndRestoreRegisterFuncs();
+        // find unwind funcs, since those have a set structure
+        // by doing this, we also take these instances of mfspr out of the "unknown memory" pool
+        FindUnwinds();
         BEBinaryReader br = new BEBinaryReader(new MemoryStream(exeBytes));
         br.BaseStream.Seek(textSectionStart, SeekOrigin.Begin);
 
-        functionBoundaries.Sort((a, b) => a.rawByteArrayStart.CompareTo(b.rawByteArrayStart));
+        // FindLargerFunctionsThatUseMFSPR();
+
+        // now, we search for instances of mfspr r12, LR (7d 88 02 a6), either followed by a savegpr func or not
+        // mfspr r12, LR (7d 88 02 a6), stw r12, X(R1) (91 81 ff f8? will it always be this?)
+        // mfspr r12, LR (7d 88 02 a6), some save reg func
+        // the end of a corresponding function: mtspr LR, r12 (7d 88 03 a6); any amount of insts (including none at all), blr (4e 80 00 20)
+
+        // take into account, PPC funcs are 16 byte aligned
+        // so keep track of the current block and make sure when you encounter the end of a func, that you skip over any extraneous bytes for alignment purposes
+
         foreach (var func in functionBoundaries) {
             Console.WriteLine($"Found {func.name} at byte offset 0x{func.rawByteArrayStart:X}");
         }
