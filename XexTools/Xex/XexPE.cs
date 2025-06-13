@@ -11,18 +11,19 @@ class XexPE {
     public class Function {
         public string name;
         public bool analyzed;
-        public uint rawByteArrayStart;
-        public uint rawByteArrayEnd;
         public uint addressStart;
         public uint addressEnd;
 
-        public Function(string name, bool analyzed, uint rawByteArrayStart, uint rawByteArrayEnd, uint addressStart, uint addressEnd) {
+        public Function(string name, bool analyzed, uint addressStart, uint addressEnd) {
             this.name = name;
             this.analyzed = analyzed;
-            this.rawByteArrayStart = rawByteArrayStart;
-            this.rawByteArrayEnd = rawByteArrayEnd;
             this.addressStart = addressStart;
             this.addressEnd = addressEnd;
+        }
+
+        // note: addr should already be calculated (i.e. not a raw byte offset)
+        public bool CheckBounds(uint addr) {
+            return addr >= addressStart && addr < addressEnd;
         }
     }
 
@@ -101,7 +102,7 @@ class XexPE {
         return offset - (uint)section.PointerToRawData + imageBase + (uint)section.VirtualAddress;
     }
 
-    // specific to bl, maybe implement b support later
+    // for both b and bl, AA is 0, so the << 2 op stays the same
     private uint CalculateBranchTarget(uint pc, uint instr) {
         // BL layout:
         // bits value
@@ -117,6 +118,14 @@ class XexPE {
         int offset = unchecked(li << 2);
         //Console.WriteLine($"PC: 0x{CalcAddrFromRawByteOffset(pc):X}, offset 0x{offset:X}, target: 0x{CalcAddrFromRawByteOffset((uint)(pc + offset)):X}");
         return CalcAddrFromRawByteOffset((uint)(pc + offset));
+    }
+
+    private bool IsOffsetPartOfKnownFunc(uint offset) {
+        uint addr = CalcAddrFromRawByteOffset(offset);
+        foreach(var func in functionBoundaries) {
+            if(func.CheckBounds(addr)) return true;
+        }
+        return false;
     }
 
     private void FindSaveAndRestoreRegisterFuncs() {
@@ -141,9 +150,9 @@ class XexPE {
         }
 
         for(int i = 14; i <= 31; i++, theSaveGPRIdx += 4) {
-            Function saveFunc = new Function($"__savegprlr_{i}", true, (uint)theSaveGPRIdx, (uint)theSaveGPRIdx + 4,
+            Function saveFunc = new Function($"__savegprlr_{i}", true,
                 CalcAddrFromRawByteOffset((uint)theSaveGPRIdx), CalcAddrFromRawByteOffset((uint)theSaveGPRIdx + 4));
-            Function restoreFunc = new Function($"__restgprlr_{i}", true, (uint)theSaveGPRIdx + 0x50, (uint)theSaveGPRIdx + 0x54,
+            Function restoreFunc = new Function($"__restgprlr_{i}", true,
                 CalcAddrFromRawByteOffset((uint)theSaveGPRIdx + 0x50), CalcAddrFromRawByteOffset((uint)theSaveGPRIdx + 0x54));
             AddFunction(saveFunc);
             AddFunction(restoreFunc);
@@ -163,9 +172,9 @@ class XexPE {
         }
 
         for (int i = 14; i <= 31; i++, theSaveFPRIdx += 4) {
-            Function saveFunc = new Function($"__savefpr_{i}", true, (uint)theSaveFPRIdx, (uint)theSaveFPRIdx + 4,
+            Function saveFunc = new Function($"__savefpr_{i}", true, 
                 CalcAddrFromRawByteOffset((uint)theSaveFPRIdx), CalcAddrFromRawByteOffset((uint)theSaveFPRIdx + 4));
-            Function restoreFunc = new Function($"__restfpr_{i}", true, (uint)theSaveFPRIdx + 0x4C, (uint)theSaveFPRIdx + 0x50,
+            Function restoreFunc = new Function($"__restfpr_{i}", true, 
                 CalcAddrFromRawByteOffset((uint)theSaveFPRIdx + 0x4C), CalcAddrFromRawByteOffset((uint)theSaveFPRIdx + 0x50));
             AddFunction(saveFunc);
             AddFunction(restoreFunc);
@@ -223,7 +232,7 @@ class XexPE {
             var curPos = br.BaseStream.Position;
             uint curInst = br.ReadUInt32();
             // if we found mfspr r12, LR
-            if(curInst == 0x7d8802a6) { // also check that curPos is not part of a known function boundary
+            if(curInst == 0x7d8802a6 && !IsOffsetPartOfKnownFunc((uint)curPos)) {
                 var nextPos = br.BaseStream.Position;
                 uint nextInst = br.ReadUInt32();
                 // if the next inst is stw, r12, -0x8(r1)
@@ -232,8 +241,8 @@ class XexPE {
                     while(br.ReadUInt32() != 0x7d8803a6);
                     // then go some more until we find the blr
                     while (br.ReadUInt32() != 0x4e800020) ;
-                    //Console.WriteLine($"Func detected from 0x{CalcAddrFromRawByteOffset((uint)curPos):X} - 0x{CalcAddrFromRawByteOffset((uint)br.BaseStream.Position):X}");
-                    Function func = new Function($"fn_{CalcAddrFromRawByteOffset((uint)curPos):X}", false, (uint)curPos, (uint)br.BaseStream.Position,
+                    Console.WriteLine($"Func detected from 0x{CalcAddrFromRawByteOffset((uint)curPos):X} - 0x{CalcAddrFromRawByteOffset((uint)br.BaseStream.Position):X}");
+                    Function func = new Function($"fn_{CalcAddrFromRawByteOffset((uint)curPos):X}", false,
                         CalcAddrFromRawByteOffset((uint)curPos), CalcAddrFromRawByteOffset((uint)br.BaseStream.Position));
                     AddFunction(func);
                 }
@@ -250,10 +259,10 @@ class XexPE {
                                 Function maybeRestoreFn = GetFunction(CalculateBranchTarget((uint)nextnextPos, nextnextInst));
                                 if(maybeRestoreFn != null && (maybeRestoreFn.name.Contains("__restgpr") || maybeRestoreFn.name.Contains("__restfpr"))) {
                                     // we found the function end, so add it to the list and then stop endlessly iterating through instrs
-                                    Function func = new Function($"fn_{CalcAddrFromRawByteOffset((uint)curPos):X}", false, (uint)curPos, (uint)br.BaseStream.Position,
+                                    Function func = new Function($"fn_{CalcAddrFromRawByteOffset((uint)curPos):X}", false,
                                         CalcAddrFromRawByteOffset((uint)curPos), CalcAddrFromRawByteOffset((uint)br.BaseStream.Position));
                                     AddFunction(func);
-                                    //Console.WriteLine($"Func detected from 0x{func.addressStart:X} - 0x{func.addressEnd:X}");
+                                    Console.WriteLine($"Func detected from 0x{func.addressStart:X} - 0x{func.addressEnd:X}");
                                     break;
                                 }
                             }
