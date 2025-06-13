@@ -5,6 +5,7 @@ using System.Text;
 using System.Threading.Tasks;
 using System.Reflection.PortableExecutable;
 using System.Diagnostics;
+using static System.Collections.Specialized.BitVector32;
 
 class XexPE {
     public class Function {
@@ -15,8 +16,6 @@ class XexPE {
         // TODO: how do you calculate these?
         public uint addressStart;
         public uint addressEnd;
-
-        public Function() { }
 
         public Function(string name, bool analyzed, uint rawByteArrayStart, uint rawByteArrayEnd, uint addressStart, uint addressEnd) {
             this.name = name;
@@ -49,12 +48,11 @@ class XexPE {
             peAdjusted.Add(xexPEImage[i]);
         }
 
-        for(int i = 0; i < headers.SectionHeaders.Length; i++) {
+        for (int i = 0; i < headers.SectionHeaders.Length; i++) {
             var section = headers.SectionHeaders[i];
+            peSections.Add(section);
             if(section.Name == ".text") {
-                textSectionStart = (uint)section.PointerToRawData;
-                textSectionEnd = textSectionStart + (uint)section.SizeOfRawData;
-                Console.WriteLine($"Text virtual address: {section.VirtualAddress:X}");
+                textSectionIndex = (uint)i;
             }
             Debug.Assert(peAdjusted.Count == section.PointerToRawData, "Unexpected PE size at this point!");
             List<byte> sectionBytes = new();
@@ -81,6 +79,21 @@ class XexPE {
         functionBoundaries.Insert(index, func);
     }
 
+    private SectionHeader CalcSectionFromRawByteOffset(uint offset) {
+        foreach(var section in peSections) {
+            if(offset >= section.PointerToRawData && offset < section.PointerToRawData + section.SizeOfRawData) {
+                return section;
+            }
+        }
+        throw new Exception($"Raw byte offset 0x{offset:X} is not part of the exe!");
+    }
+
+    private uint CalcTextAddrFromRawByteOffset(uint offset) {
+        SectionHeader section = CalcSectionFromRawByteOffset(offset);
+        // offset is like, raw byte offset of the whole exe, not just the section
+        return offset - (uint)section.PointerToRawData + imageBase + (uint)section.VirtualAddress;
+    }
+
     private void FindSaveAndRestoreRegisterFuncs() {
         // the asm corresponding to savegprlrs 14-17 and savefprs 14-17
         // stands to reason that if we find these in sequence, 18-31 will be right behind
@@ -89,11 +102,12 @@ class XexPE {
 
         int theSaveGPRIdx = -1;
 
-        for(int i = (int)textSectionStart; i < textSectionEnd - saveGPRasm.Length; i++) {
+        SectionHeader section = peSections[(int)textSectionIndex];
+
+        for(int i = section.VirtualAddress; i < (section.VirtualAddress + section.SizeOfRawData) - saveGPRasm.Length; i++) {
             if (exeBytes.Skip(i).Take(saveGPRasm.Length).SequenceEqual(saveGPRasm)) {
-                //Console.WriteLine($"Found the savegpr funcs! They're at i = 0x{i:X}");
-                // evil hack: if we find the saveGPR sequence multiple times, take the last instance
                 theSaveGPRIdx = i;
+                break;
             }
         }
 
@@ -102,19 +116,21 @@ class XexPE {
         }
 
         for(int i = 14; i <= 31; i++, theSaveGPRIdx += 4) {
-            Function saveFunc = new Function($"__savegprlr_{i}", true, (uint)theSaveGPRIdx, (uint)theSaveGPRIdx + 4, 0, 0);
-            Function restoreFunc = new Function($"__restgprlr_{i}", true, (uint)theSaveGPRIdx + 0x48, (uint)theSaveGPRIdx + 0x4C, 0, 0);
+            Function saveFunc = new Function($"__savegprlr_{i}", true, (uint)theSaveGPRIdx, (uint)theSaveGPRIdx + 4,
+                CalcTextAddrFromRawByteOffset((uint)theSaveGPRIdx), CalcTextAddrFromRawByteOffset((uint)theSaveGPRIdx + 4));
+            Function restoreFunc = new Function($"__restgprlr_{i}", true, (uint)theSaveGPRIdx + 0x50, (uint)theSaveGPRIdx + 0x54,
+                CalcTextAddrFromRawByteOffset((uint)theSaveGPRIdx + 0x50), CalcTextAddrFromRawByteOffset((uint)theSaveGPRIdx + 0x54));
             AddFunction(saveFunc);
             AddFunction(restoreFunc);
         }
 
         int theSaveFPRIdx = -1;
 
-        for (int i = (int)textSectionStart; i < textSectionEnd - saveFPRasm.Length; i++) {
+        for (int i = section.VirtualAddress; i < (section.VirtualAddress + section.SizeOfRawData) - saveGPRasm.Length; i++) {
             if (exeBytes.Skip(i).Take(saveGPRasm.Length).SequenceEqual(saveFPRasm)) {
                 //Console.WriteLine($"Found the savefpr funcs! They're at i = 0x{i:X}");
-                // evil hack: if we find the saveFPR sequence multiple times, take the last instance
                 theSaveFPRIdx = i;
+                break;
             }
         }
 
@@ -123,8 +139,10 @@ class XexPE {
         }
 
         for (int i = 14; i <= 31; i++, theSaveFPRIdx += 4) {
-            Function saveFunc = new Function($"__savefpr_{i}", true, (uint)theSaveFPRIdx, (uint)theSaveFPRIdx + 4, 0, 0);
-            Function restoreFunc = new Function($"__restfpr_{i}", true, (uint)theSaveFPRIdx + 0x48, (uint)theSaveFPRIdx + 0x4C, 0, 0);
+            Function saveFunc = new Function($"__savefpr_{i}", true, (uint)theSaveFPRIdx, (uint)theSaveFPRIdx + 4,
+                CalcTextAddrFromRawByteOffset((uint)theSaveFPRIdx), CalcTextAddrFromRawByteOffset((uint)theSaveFPRIdx + 4));
+            Function restoreFunc = new Function($"__restfpr_{i}", true, (uint)theSaveFPRIdx + 0x4C, (uint)theSaveFPRIdx + 0x50,
+                CalcTextAddrFromRawByteOffset((uint)theSaveFPRIdx + 0x4C), CalcTextAddrFromRawByteOffset((uint)theSaveFPRIdx + 0x50));
             AddFunction(saveFunc);
             AddFunction(restoreFunc);
         }
@@ -134,44 +152,44 @@ class XexPE {
     }
 
     private void FindUnwinds() {
-        BEBinaryReader br = new BEBinaryReader(new MemoryStream(exeBytes));
-        br.BaseStream.Seek(textSectionStart, SeekOrigin.Begin);
+        //BEBinaryReader br = new BEBinaryReader(new MemoryStream(exeBytes));
+        //br.BaseStream.Seek(textSectionStart, SeekOrigin.Begin);
 
-        // look for the pattern:
-        // subi r31, r12, X - if (instr & 0xFC1F8000) == 0x3F8C0000, this is subi r31, r12, X
-        // mfspr r12, LR - 7d8802a6
-        // ...
-        // mtspr LR, r12 - 7d8803a6
-        // blr - 4e800020
+        //// look for the pattern:
+        //// subi r31, r12, X - if (instr & 0xFC1F8000) == 0x3F8C0000, this is subi r31, r12, X
+        //// mfspr r12, LR - 7d8802a6
+        //// ...
+        //// mtspr LR, r12 - 7d8803a6
+        //// blr - 4e800020
 
-        while (br.BaseStream.Position < br.BaseStream.Length) {
-            uint curInst = br.ReadUInt32();
-            // if the current inst is: subi r31, r12, XXXX
-            if((curInst & 0xFC1F8000) == 0x3F8C000) {
-                var curPos = br.BaseStream.Position;
-                uint mfsprCheck = br.ReadUInt32();
-                // if the next inst over is: mfspr r12, LR
-                if (mfsprCheck == 0x7D8802A6) {
-                    // if we've found both these insts in sequence, we've found an unwind
-                    Function unwindFunc = new Function();
-                    unwindFunc.rawByteArrayStart = (uint)curPos;
-                    unwindFunc.name = $"Unwind_{unwindFunc.rawByteArrayStart}";
-                    unwindFunc.analyzed = false;
-                    // read every subsequent inst until we find the combination of:
-                    // mtspr LR, r12, and blr
-                    while (br.ReadUInt32() != 0x7D8803A6) ;
-                    uint shouldBeBLR = br.ReadUInt32();
-                    Debug.Assert(shouldBeBLR == 0x4E800020);
-                    unwindFunc.rawByteArrayEnd = (uint)br.BaseStream.Position;
-                    unwindFunc.addressStart = unwindFunc.addressEnd = 0;
-                    AddFunction(unwindFunc);
-                }
-                else {
-                    // this wasn't an unwind, takesies backsies on the stream position then
-                    br.BaseStream.Seek(curPos, SeekOrigin.Begin);
-                }
-            }
-        }
+        //while (br.BaseStream.Position < br.BaseStream.Length) {
+        //    uint curInst = br.ReadUInt32();
+        //    // if the current inst is: subi r31, r12, XXXX
+        //    if((curInst & 0xFC1F8000) == 0x3F8C000) {
+        //        var curPos = br.BaseStream.Position;
+        //        uint mfsprCheck = br.ReadUInt32();
+        //        // if the next inst over is: mfspr r12, LR
+        //        if (mfsprCheck == 0x7D8802A6) {
+        //            // if we've found both these insts in sequence, we've found an unwind
+        //            Function unwindFunc = new Function();
+        //            unwindFunc.rawByteArrayStart = (uint)curPos;
+        //            unwindFunc.name = $"Unwind_{unwindFunc.rawByteArrayStart}";
+        //            unwindFunc.analyzed = false;
+        //            // read every subsequent inst until we find the combination of:
+        //            // mtspr LR, r12, and blr
+        //            while (br.ReadUInt32() != 0x7D8803A6) ;
+        //            uint shouldBeBLR = br.ReadUInt32();
+        //            Debug.Assert(shouldBeBLR == 0x4E800020);
+        //            unwindFunc.rawByteArrayEnd = (uint)br.BaseStream.Position;
+        //            unwindFunc.addressStart = unwindFunc.addressEnd = 0;
+        //            AddFunction(unwindFunc);
+        //        }
+        //        else {
+        //            // this wasn't an unwind, takesies backsies on the stream position then
+        //            br.BaseStream.Seek(curPos, SeekOrigin.Begin);
+        //        }
+        //    }
+        //}
     }
 
     public void FindFunctionBoundaries() {
@@ -181,7 +199,7 @@ class XexPE {
         // by doing this, we also take these instances of mfspr out of the "unknown memory" pool
         FindUnwinds();
         BEBinaryReader br = new BEBinaryReader(new MemoryStream(exeBytes));
-        br.BaseStream.Seek(textSectionStart, SeekOrigin.Begin);
+        //br.BaseStream.Seek(textSectionStart, SeekOrigin.Begin);
 
         // FindLargerFunctionsThatUseMFSPR();
 
@@ -194,7 +212,7 @@ class XexPE {
         // so keep track of the current block and make sure when you encounter the end of a func, that you skip over any extraneous bytes for alignment purposes
 
         foreach (var func in functionBoundaries) {
-            Console.WriteLine($"Found {func.name} at byte offset 0x{func.rawByteArrayStart:X}");
+            Console.WriteLine($"Found {func.name} at virtual address 0x{func.addressStart:X}");
         }
 
         // find function prologues to get known start addresses
@@ -230,7 +248,7 @@ class XexPE {
     public byte[] exeBytes;
     public uint entryPointAddress;
     public uint imageBase;
-    public uint textSectionStart;
-    public uint textSectionEnd;
+    public uint textSectionIndex;
+    public List<SectionHeader> peSections = new();
     public List<Function> functionBoundaries = new();
 }
