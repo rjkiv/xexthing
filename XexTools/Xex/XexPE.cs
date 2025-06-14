@@ -5,7 +5,6 @@ using System.Text;
 using System.Threading.Tasks;
 using System.Reflection.PortableExecutable;
 using System.Diagnostics;
-using static System.Collections.Specialized.BitVector32;
 
 class XexPE {
     public class Function {
@@ -181,122 +180,93 @@ class XexPE {
         }
     }
 
-    private void FindUnwinds() {
-        //BEBinaryReader br = new BEBinaryReader(new MemoryStream(exeBytes));
-        //br.BaseStream.Seek(textSectionStart, SeekOrigin.Begin);
-
-        //// look for the pattern:
-        //// subi r31, r12, X - if (instr & 0xFC1F8000) == 0x3F8C0000, this is subi r31, r12, X
-        //// mfspr r12, LR - 7d8802a6
-        //// ...
-        //// mtspr LR, r12 - 7d8803a6
-        //// blr - 4e800020
-
-        //while (br.BaseStream.Position < br.BaseStream.Length) {
-        //    uint curInst = br.ReadUInt32();
-        //    // if the current inst is: subi r31, r12, XXXX
-        //    if((curInst & 0xFC1F8000) == 0x3F8C000) {
-        //        var curPos = br.BaseStream.Position;
-        //        uint mfsprCheck = br.ReadUInt32();
-        //        // if the next inst over is: mfspr r12, LR
-        //        if (mfsprCheck == 0x7D8802A6) {
-        //            // if we've found both these insts in sequence, we've found an unwind
-        //            Function unwindFunc = new Function();
-        //            unwindFunc.rawByteArrayStart = (uint)curPos;
-        //            unwindFunc.name = $"Unwind_{unwindFunc.rawByteArrayStart}";
-        //            unwindFunc.analyzed = false;
-        //            // read every subsequent inst until we find the combination of:
-        //            // mtspr LR, r12, and blr
-        //            while (br.ReadUInt32() != 0x7D8803A6) ;
-        //            uint shouldBeBLR = br.ReadUInt32();
-        //            Debug.Assert(shouldBeBLR == 0x4E800020);
-        //            unwindFunc.rawByteArrayEnd = (uint)br.BaseStream.Position;
-        //            unwindFunc.addressStart = unwindFunc.addressEnd = 0;
-        //            AddFunction(unwindFunc);
-        //        }
-        //        else {
-        //            // this wasn't an unwind, takesies backsies on the stream position then
-        //            br.BaseStream.Seek(curPos, SeekOrigin.Begin);
-        //        }
-        //    }
-        //}
+    private bool AddrIsText(uint addr) {
+        SectionHeader textSection = peSections[(int)textSectionIndex];
+        uint textBegin = (uint)textSection.VirtualAddress + imageBase;
+        uint textEnd = textBegin + (uint)textSection.VirtualSize;
+        return addr >= textBegin && addr < textEnd;
     }
 
-    private void FindMFSPRs() {
-        SectionHeader section = peSections[(int)textSectionIndex];
+    private List<uint> SweepForKnownFuncStartAddrs() {
+        HashSet<uint> knownAddrs = new();
+        SectionHeader textSection = peSections[(int)textSectionIndex];
+        uint textBegin = (uint)textSection.VirtualAddress + imageBase;
+        uint textEnd = textBegin + (uint)textSection.VirtualSize;
 
         BEBinaryReader br = new BEBinaryReader(new MemoryStream(exeBytes));
-        br.BaseStream.Seek(section.PointerToRawData, SeekOrigin.Begin);
+        br.BaseStream.Seek(textSection.PointerToRawData, SeekOrigin.Begin);
 
-        while(br.BaseStream.Position < br.BaseStream.Length) {
+        while(br.BaseStream.Position < textSection.PointerToRawData + textSection.SizeOfRawData) {
             var curPos = br.BaseStream.Position;
             uint curInst = br.ReadUInt32();
-            // if we found mfspr r12, LR
-            if(curInst == 0x7d8802a6 && !IsOffsetPartOfKnownFunc((uint)curPos)) {
-                var nextPos = br.BaseStream.Position;
-                uint nextInst = br.ReadUInt32();
-                // if the next inst is stw, r12, -0x8(r1)
-                if(nextInst == 0x9181fff8){
-                    // keep going til we find the mtspr LR, r12
-                    while(br.ReadUInt32() != 0x7d8803a6);
-                    // then go some more until we find the blr
-                    while (br.ReadUInt32() != 0x4e800020) ;
-                    Console.WriteLine($"Func detected from 0x{CalcAddrFromRawByteOffset((uint)curPos):X} - 0x{CalcAddrFromRawByteOffset((uint)br.BaseStream.Position):X}");
-                    Function func = new Function($"fn_{CalcAddrFromRawByteOffset((uint)curPos):X}", false,
-                        CalcAddrFromRawByteOffset((uint)curPos), CalcAddrFromRawByteOffset((uint)br.BaseStream.Position));
-                    AddFunction(func);
-                }
-                // if nextInst is a bl to a save reg func
-                else if (PPCHelper.IsBL(nextInst)) {
-                    Function maybeSaveFn = GetFunction(CalculateBranchTarget((uint)nextPos, nextInst));
-                    if(maybeSaveFn != null && (maybeSaveFn.name.Contains("__savegpr") || maybeSaveFn.name.Contains("__savefpr"))){
-                        // iterate until you find the b restgpr
-                        while (true) {
-                            var nextnextPos = br.BaseStream.Position;
-                            uint nextnextInst = br.ReadUInt32();
-                            if (PPCHelper.IsBranch(nextnextInst)) {
-                                //Console.WriteLine($"Possible restore fn found at address 0x{CalcAddrFromRawByteOffset((uint)nextnextPos):X}");
-                                Function maybeRestoreFn = GetFunction(CalculateBranchTarget((uint)nextnextPos, nextnextInst));
-                                if(maybeRestoreFn != null && (maybeRestoreFn.name.Contains("__restgpr") || maybeRestoreFn.name.Contains("__restfpr"))) {
-                                    // we found the function end, so add it to the list and then stop endlessly iterating through instrs
-                                    Function func = new Function($"fn_{CalcAddrFromRawByteOffset((uint)curPos):X}", false,
-                                        CalcAddrFromRawByteOffset((uint)curPos), CalcAddrFromRawByteOffset((uint)br.BaseStream.Position));
-                                    AddFunction(func);
-                                    Console.WriteLine($"Func detected from 0x{func.addressStart:X} - 0x{func.addressEnd:X}");
-                                    break;
-                                }
-                            }
-                        }
-                    }
+            // if this is a bl, note down the branch target
+            if (PPCHelper.IsBL(curInst)) {
+                uint branchTarget = CalculateBranchTarget((uint)curPos, curInst);
+                if(branchTarget >= textBegin && branchTarget < textEnd && knownAddrs.Add(branchTarget)) {
+                    //Console.WriteLine($"Added new func start: 0x{branchTarget:X}");
                 }
             }
-            
+            // else, if this is subi r31, r12, XXXX
+            else if((curInst & 0xFC1F8000) == 0x3F8C000) {
+                var subiPos = br.BaseStream.Position;
+                uint mfsprCheck = br.ReadUInt32();
+                // and if the next instr is mfspr r12, LR
+                if(mfsprCheck == 0x7D8802A6) {
+                    if(knownAddrs.Add(CalcAddrFromRawByteOffset((uint)curPos))) {
+                        //Console.WriteLine($"Added new func start: 0x{CalcAddrFromRawByteOffset((uint)curPos):X}");
+                    }
+                }
+                else {
+                    // this wasn't an unwind prologue, takesies backsies on the stream position then
+                    br.BaseStream.Seek(subiPos, SeekOrigin.Begin);
+                }
+            }
+            // else if this is mfspr r12, LR
+            else if(curInst == 0x7D8802A6) {
+                if (knownAddrs.Add(CalcAddrFromRawByteOffset((uint)curPos))) {
+                    //Console.WriteLine($"Added new func start: 0x{CalcAddrFromRawByteOffset((uint)curPos):X}");
+                }
+            }
         }
+
+        List<uint> sortedAddrs = knownAddrs.ToList();
+        sortedAddrs.Sort();
+        return sortedAddrs;
+    }
+
+    private uint NextKnownStartAddr(uint addr) {
+        SectionHeader textSection = peSections[(int)textSectionIndex];
+        uint textBegin = (uint)textSection.VirtualAddress + imageBase;
+        uint textEnd = textBegin + (uint)textSection.VirtualSize;
+        foreach(var knownAddr in knownStartAddrs) {
+            if (knownAddr > addr) return knownAddr;
+        }
+        return textEnd;
     }
 
     public void FindFunctionBoundaries() {
         // initial sweep to find and label the save/restore reg funcs
         FindSaveAndRestoreRegisterFuncs();
-        // find unwind funcs, since those have a set structure
-        // by doing this, we also take these instances of mfspr out of the "unknown memory" pool
-        FindUnwinds();
-        // now, we search for instances of mfspr r12, LR (7d 88 02 a6), either followed by a savegpr func or not
-        // mfspr r12, LR (7d 88 02 a6), stw r12, X(R1) (91 81 ff f8? will it always be this?)
-        // mfspr r12, LR (7d 88 02 a6), some save reg func
-        // the end of a corresponding function: mtspr LR, r12 (7d 88 03 a6); any amount of insts (including none at all), blr (4e 80 00 20)
-
-        // take into account, PPC funcs are 16 byte aligned
-        // so keep track of the current block and make sure when you encounter the end of a func, that you skip over any extraneous bytes for alignment purposes
-        FindMFSPRs();
+        // do a sweep to find known start addresses from
+        // 1. bl targets
+        // 2. any funcs that start with stwu/mfspr, or just mfspr
+        knownStartAddrs = SweepForKnownFuncStartAddrs();
 
         BEBinaryReader br = new BEBinaryReader(new MemoryStream(exeBytes));
-        //br.BaseStream.Seek(textSectionStart, SeekOrigin.Begin);
+        SectionHeader textSection = peSections[(int)textSectionIndex];
+        br.BaseStream.Seek(textSection.PointerToRawData, SeekOrigin.Begin);
+        while(br.BaseStream.Position < textSection.PointerToRawData + textSection.SizeOfRawData) {
+            var curPos = br.BaseStream.Position;
+            uint curAddr = CalcAddrFromRawByteOffset((uint)curPos);
+            Console.WriteLine($"Current PC: 0x{curAddr:X}");
+            Console.WriteLine($"The func is from 0x{curAddr:X} til up to 0x{NextKnownStartAddr(curAddr):X}");
+            // TODO: CFA the func that starts at curAddr
+        }
 
-        //foreach (var func in functionBoundaries) {
-        //    Console.WriteLine($"Found {func.name} at virtual address 0x{func.addressStart:X}");
+
+        //foreach(var addr in knownStartAddrs) {
+        //    Console.WriteLine($"Func start addr: 0x{addr:X}");
         //}
-
-        // find function prologues to get known start addresses
 
         // blr: 4e 80 00 20
 
@@ -330,6 +300,7 @@ class XexPE {
     public uint entryPointAddress;
     public uint imageBase;
     public uint textSectionIndex;
+    public List<uint> knownStartAddrs = new();
     public List<SectionHeader> peSections = new();
     public List<Function> functionBoundaries = new();
 }
