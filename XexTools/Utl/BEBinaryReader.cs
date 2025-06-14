@@ -17,4 +17,11 @@ class BEBinaryReader : BinaryReader {
         Array.Reverse(data);
         return BitConverter.ToUInt32(data, 0);
     }
+
+    public uint PeekUInt32() {
+        var curPos = BaseStream.Position;
+        uint ret = ReadUInt32();
+        BaseStream.Seek(curPos, SeekOrigin.Begin);
+        return ret;
+    }
 }

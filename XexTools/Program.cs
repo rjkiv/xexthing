@@ -16,11 +16,11 @@ class Program {
         Console.WriteLine(groundTruth);
         byte[] fileData = File.ReadAllBytes(filePath);
 
-        PEReader pr = new PEReader(new MemoryStream(File.ReadAllBytes(groundTruth)));
-        var textSection = pr.GetSectionData(".text");
-        Console.WriteLine(textSection);
-        var reader = textSection.GetReader();
-        Console.WriteLine(reader.ReadUInt32());
+        //PEReader pr = new PEReader(new MemoryStream(File.ReadAllBytes(groundTruth)));
+        //var textSection = pr.GetSectionData(".text");
+        //Console.WriteLine(textSection);
+        //var reader = textSection.GetReader();
+        //Console.WriteLine(reader.ReadUInt32());
 
         // 1. read in the xex, and get the resulting exe
         BEBinaryReader br = new BEBinaryReader(new MemoryStream(fileData));

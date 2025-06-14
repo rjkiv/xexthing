@@ -5,6 +5,7 @@ using System.Text;
 using System.Threading.Tasks;
 using System.Reflection.PortableExecutable;
 using System.Diagnostics;
+using System.IO;
 
 class XexPE {
     public class Function {
@@ -118,6 +119,15 @@ class XexPE {
         //Console.WriteLine($"PC: 0x{CalcAddrFromRawByteOffset(pc):X}, offset 0x{offset:X}, target: 0x{CalcAddrFromRawByteOffset((uint)(pc + offset)):X}");
         return CalcAddrFromRawByteOffset((uint)(pc + offset));
     }
+    // for bc and bcl
+    private uint CalculateConditionalBranchTarget(uint pc, uint instr) {
+        short bd = (short)((instr >> 2) & 0x3FFF);
+        if((bd & 0x2000) != 0) {
+            bd |= unchecked((short)0xE000);
+        }
+        bd = unchecked((short)(bd << 2));
+        return CalcAddrFromRawByteOffset((uint)(pc + bd));
+    }
 
     private bool IsOffsetPartOfKnownFunc(uint offset) {
         uint addr = CalcAddrFromRawByteOffset(offset);
@@ -208,17 +218,12 @@ class XexPE {
             }
             // else, if this is subi r31, r12, XXXX
             else if((curInst & 0xFC1F8000) == 0x3F8C000) {
-                var subiPos = br.BaseStream.Position;
-                uint mfsprCheck = br.ReadUInt32();
+                uint mfsprCheck = br.PeekUInt32();
                 // and if the next instr is mfspr r12, LR
                 if(mfsprCheck == 0x7D8802A6) {
                     if(knownAddrs.Add(CalcAddrFromRawByteOffset((uint)curPos))) {
                         //Console.WriteLine($"Added new func start: 0x{CalcAddrFromRawByteOffset((uint)curPos):X}");
                     }
-                }
-                else {
-                    // this wasn't an unwind prologue, takesies backsies on the stream position then
-                    br.BaseStream.Seek(subiPos, SeekOrigin.Begin);
                 }
             }
             // else if this is mfspr r12, LR
@@ -244,6 +249,69 @@ class XexPE {
         return textEnd;
     }
 
+    private uint FindFunctionEnd(BEBinaryReader br, uint startAddr, uint maxAddr) {
+        var worklist = new Queue<uint>();
+        var visited = new HashSet<uint>();
+        uint highestAddr = startAddr;
+        SectionHeader textSection = peSections[(int)textSectionIndex];
+        uint textSectionBegin = (uint)textSection.VirtualAddress + imageBase;
+        uint textSectionEnd = textSectionBegin + (uint)textSection.SizeOfRawData;
+
+        worklist.Enqueue(startAddr);
+
+        while(worklist.Count > 0) {
+            uint addr = worklist.Dequeue();
+
+            if(visited.Contains(addr) || addr >= maxAddr || addr < textSectionBegin)
+                continue;
+
+            visited.Add(addr);
+            if (addr > highestAddr)
+                highestAddr = addr;
+
+            int offset = textSection.PointerToRawData + (int)(addr - textSectionBegin);
+            if (offset + 4 > textSectionEnd) continue;
+
+            br.BaseStream.Seek(offset, SeekOrigin.Begin);
+            uint instr = br.PeekUInt32();
+
+            // if blr
+            if (PPCHelper.IsBLR(instr)) continue;
+
+            // if unconditional branch (b or bl)
+            if(PPCHelper.IsBranch(instr) || PPCHelper.IsBL(instr)) {
+                uint target = CalculateBranchTarget((uint)offset, instr);
+                if(target >= textSectionBegin && target > startAddr && target < maxAddr) {
+                    // TODO: if this is a b, and we've reached this point, handle additional logic to determine if this b is a tail call or not
+                    worklist.Enqueue(target);
+                }
+
+                if (PPCHelper.IsBL(instr)) {
+                    worklist.Enqueue(addr + 4);
+                }
+                continue;
+            }
+
+            // if conditional branch (bc or bcl)
+            // TODO: add extra logic to check for bgt's to jump tables
+            if(PPCHelper.IsConditionalBranch(instr)) {
+                uint target = CalculateConditionalBranchTarget((uint)offset, instr);
+                if (target >= textSectionBegin && target > startAddr && target < maxAddr)
+                    worklist.Enqueue(target);
+
+                worklist.Enqueue(addr + 4); // fallthrough path
+                continue;
+            }
+
+            // this current inst ain't nothin special, just go ahead and add the next addr over
+            worklist.Enqueue(addr + 4);
+        }
+
+        //Console.WriteLine($"Func that starts at 0x{startAddr:X}, ends at 0x{highestAddr + 4:X}");
+
+        return highestAddr + 4;
+    }
+
     public void FindFunctionBoundaries() {
         // initial sweep to find and label the save/restore reg funcs
         FindSaveAndRestoreRegisterFuncs();
@@ -252,18 +320,63 @@ class XexPE {
         // 2. any funcs that start with stwu/mfspr, or just mfspr
         knownStartAddrs = SweepForKnownFuncStartAddrs();
 
+        //string funcsDump = "";
+
         BEBinaryReader br = new BEBinaryReader(new MemoryStream(exeBytes));
         SectionHeader textSection = peSections[(int)textSectionIndex];
         br.BaseStream.Seek(textSection.PointerToRawData, SeekOrigin.Begin);
         while(br.BaseStream.Position < textSection.PointerToRawData + textSection.SizeOfRawData) {
+            // note current PC and virtual addr
             var curPos = br.BaseStream.Position;
             uint curAddr = CalcAddrFromRawByteOffset((uint)curPos);
-            Console.WriteLine($"Current PC: 0x{curAddr:X}");
-            Console.WriteLine($"The func is from 0x{curAddr:X} til up to 0x{NextKnownStartAddr(curAddr):X}");
-            // TODO: CFA the func that starts at curAddr
+
+            // ignore zero-padding
+            if (br.PeekUInt32() == 0) {
+                br.BaseStream.Seek(4, SeekOrigin.Current);
+                continue;
+            }
+            // ignore the save/restore reg funcs we found earlier
+            else if (GetFunction(curAddr) != null) {
+                Function func = GetFunction(curAddr);
+                if (func.name.Contains("__savegprlr") || func.name.Contains("__restgprlr")) {
+                    Function lastRestoreFunc = GetFunction("__restgprlr_31");
+                    //Console.WriteLine($"We now want to seek to the end of restgprlr31, 0x{lastRestoreFunc.addressEnd:X}");
+                    //Console.WriteLine($"Since we're currently at 0x{curAddr:X}, we have to seek ahead by 0x{(lastRestoreFunc.addressEnd - curAddr):X} bytes");
+                    br.BaseStream.Seek(lastRestoreFunc.addressEnd - curAddr, SeekOrigin.Current);
+                    continue;
+                }
+                else if(func.name.Contains("__savefpr") || func.name.Contains("__restfpr")) {
+                    Function lastRestoreFunc = GetFunction("__restfpr_31");
+                    br.BaseStream.Seek(lastRestoreFunc.addressEnd - curAddr, SeekOrigin.Current);
+                    continue;
+                }
+            }
+            //// ignore random branches to xidata (or should we be ignoring these?)
+            //else {
+            //    var maybeBranchPC = br.BaseStream.Position;
+            //    uint maybeBranchInstr = br.PeekUInt32();
+            //    if(PPCHelper.IsBranch(maybeBranchInstr)) {
+            //        uint target = CalculateBranchTarget((uint)maybeBranchPC, maybeBranchInstr);
+            //        if (!AddrIsText(target)) {
+            //            br.BaseStream.Seek(4, SeekOrigin.Current);
+            //            continue;
+            //        }
+            //    }
+            //}
+
+            uint nextKnownStartAddr = NextKnownStartAddr(curAddr);
+            //Console.WriteLine($"The func is from 0x{curAddr:X} til up to 0x{nextKnownStartAddr:X}");
+            uint funcEnd = FindFunctionEnd(br, curAddr, nextKnownStartAddr);
+            //funcsDump += $"fn_{curAddr:X}: 0x{curAddr:X} - 0x{funcEnd:X}\n";
+            AddFunction(new Function($"fn_{curAddr:X}", true, curAddr, funcEnd));
+
+            // now that we know where the func ends, seek to that addr and go again
+            br.BaseStream.Seek(curPos + (funcEnd - curAddr), SeekOrigin.Begin);
         }
 
+        Console.WriteLine($"Found {functionBoundaries.Count} functions");
 
+        //File.WriteAllText("D:\\DC3 Debug\\Gamepad\\Debug\\jeff_funcs_cfa.txt", funcsDump);
         //foreach(var addr in knownStartAddrs) {
         //    Console.WriteLine($"Func start addr: 0x{addr:X}");
         //}
