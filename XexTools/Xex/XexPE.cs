@@ -25,6 +25,19 @@ class XexPE {
         public bool CheckBounds(uint addr) {
             return addr >= addressStart && addr < addressEnd;
         }
+
+        public bool IsGPRIntrinsic() {
+            return name.Contains("__savegprlr") || name.Contains("__restgprlr");
+        }
+
+        public bool IsFPRIntrinsic() {
+            return name.Contains("__savefpr") || name.Contains("__restfpr");
+        }
+
+        public bool IsRegIntrinsic() {
+            return IsGPRIntrinsic() || IsFPRIntrinsic();
+        }
+
     }
 
     public void ImportExeFromXex(byte[] xexPEImage) {
@@ -256,6 +269,7 @@ class XexPE {
         SectionHeader textSection = peSections[(int)textSectionIndex];
         uint textSectionBegin = (uint)textSection.VirtualAddress + imageBase;
         uint textSectionEnd = textSectionBegin + (uint)textSection.SizeOfRawData;
+        var originalPos = br.BaseStream.Position; // the position in the BR corresponding to the start of the func
 
         worklist.Enqueue(startAddr);
 
@@ -275,15 +289,64 @@ class XexPE {
             br.BaseStream.Seek(offset, SeekOrigin.Begin);
             uint instr = br.PeekUInt32();
 
+            // if we somehow managed to have a 0 slip through the cracks, stop, this is the end
+            if (instr == 0) {
+                highestAddr -= 4;
+                break;
+            }
+
             // if blr
             if (PPCHelper.IsBLR(instr)) continue;
 
             // if unconditional branch (b or bl)
             if(PPCHelper.IsBranch(instr) || PPCHelper.IsBL(instr)) {
                 uint target = CalculateBranchTarget((uint)offset, instr);
+                // if the target is within the bounds of (startAddr, maxAddr), add it to our analysis queue
                 if(target >= textSectionBegin && target > startAddr && target < maxAddr) {
-                    // TODO: if this is a b, and we've reached this point, handle additional logic to determine if this b is a tail call or not
                     worklist.Enqueue(target);
+                }
+                else {
+                    // else, if this is a b, this *might* be a tail call
+                    // TODO: handle additional logic to determine if this b is a tail call or not
+                    if (PPCHelper.IsBranch(instr)) {
+
+                        br.BaseStream.Seek(4, SeekOrigin.Current);
+                        uint nextInst = br.PeekUInt32();
+                        // if the next instruction over is all 0's, this is definitely a tail call
+                        if (nextInst == 0) {
+                            break;
+                        }
+                        // if the next instruction over's addr == maxAddr, tail call
+                        else if(addr + 4 == maxAddr) {
+                            break;
+                        }
+                        // if the next instruction over's addr < highestAddr + 4, it's NOT a tail call
+                        // use addr + 4 for this
+                        else if (addr + 4 < highestAddr + 4) {
+                            // NOT a tail call, don't do anything
+                        }
+                        // if addr + 4 == highestAddr + 4 AND highestAddr + 4 is in the workList, don't mark it as a tail call, because we don't know for sure
+                        // explorer that inst first instead of coming to a concrete conclusion
+                        else if((addr + 4 == highestAddr + 4) && worklist.Contains(addr + 4)) {
+                            // we don't know for sure, so don't do anything
+                        }
+                        // if the target is either NOT part of a known function
+                        // OR target is NOT one of our reg compiler intrinsics
+                        else if (GetFunction(target) == null || !GetFunction(target).IsRegIntrinsic()) {
+                            // if the b target is past the known start addr of this func, definitely a tail call
+                            if (target < startAddr) {
+                                break;
+                            }
+                            // if the b target is at or past the known start addr of a later func, definitely a tail call
+                            if (target >= maxAddr) {
+                                break;
+                            }
+                        }
+                        else {
+                            //Console.WriteLine($"Next inst: 0x{addr + 4:X}, startAddr: 0x{startAddr:X}, calculated max: 0x{highestAddr + 4:X}");
+                            Console.WriteLine($"Branch at 0x{addr:X} might be a tail call!");
+                        }
+                    }
                 }
 
                 if (PPCHelper.IsBL(instr)) {
@@ -308,7 +371,8 @@ class XexPE {
         }
 
         //Console.WriteLine($"Func that starts at 0x{startAddr:X}, ends at 0x{highestAddr + 4:X}");
-
+        // size: highestAddr + 4 - startAddr, jump forward by this much
+        // TODO: do the BR jump here
         return highestAddr + 4;
     }
 
@@ -320,7 +384,7 @@ class XexPE {
         // 2. any funcs that start with stwu/mfspr, or just mfspr
         knownStartAddrs = SweepForKnownFuncStartAddrs();
 
-        //string funcsDump = "";
+        string funcsDump = "";
 
         BEBinaryReader br = new BEBinaryReader(new MemoryStream(exeBytes));
         SectionHeader textSection = peSections[(int)textSectionIndex];
@@ -367,7 +431,7 @@ class XexPE {
             uint nextKnownStartAddr = NextKnownStartAddr(curAddr);
             //Console.WriteLine($"The func is from 0x{curAddr:X} til up to 0x{nextKnownStartAddr:X}");
             uint funcEnd = FindFunctionEnd(br, curAddr, nextKnownStartAddr);
-            //funcsDump += $"fn_{curAddr:X}: 0x{curAddr:X} - 0x{funcEnd:X}\n";
+            funcsDump += $"fn_{curAddr:X}: 0x{curAddr:X} - 0x{funcEnd:X}\n";
             AddFunction(new Function($"fn_{curAddr:X}", true, curAddr, funcEnd));
 
             // now that we know where the func ends, seek to that addr and go again
@@ -376,7 +440,7 @@ class XexPE {
 
         Console.WriteLine($"Found {functionBoundaries.Count} functions");
 
-        //File.WriteAllText("D:\\DC3 Debug\\Gamepad\\Debug\\jeff_funcs_cfa.txt", funcsDump);
+        File.WriteAllText("D:\\DC3 Debug\\Gamepad\\Debug\\jeff_funcs_cfa.txt", funcsDump);
         //foreach(var addr in knownStartAddrs) {
         //    Console.WriteLine($"Func start addr: 0x{addr:X}");
         //}
