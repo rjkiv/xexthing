@@ -24,7 +24,7 @@ class XexHeader {
     public byte[] peImage;
 
     public void DecryptFileKey() {
-        byte[] key = new byte[16]; // TODO: this will be different for retail xex's
+        byte[] key = new byte[16]; // TODO: this will be different for retail xex's (i.e. did not come from a dev kit): 20B185A59D28FDC340583FBB0896BF91
         sessionKey = AesHelper.DecryptAesCbcNoPadding(key, loaderInfo.fileKey);
     }
 
