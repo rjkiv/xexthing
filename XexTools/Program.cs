@@ -46,6 +46,7 @@ class Program {
 
         // 3. Control Flow Analysis
         xexPE.FindFunctionBoundaries();
+        xexPE.VerifyAgainstMap(xexMap);
 
         //// Print Machine type
         //Console.WriteLine($"Machine enum: 0x{(ushort)headers.CoffHeader.Machine:X}");

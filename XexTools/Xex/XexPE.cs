@@ -442,37 +442,22 @@ class XexPE {
 
         Console.WriteLine($"Found {functionBoundaries.Count} functions");
         DumpFuncs();
+        // need to resolve jump tables
+    }
 
-        //foreach(var addr in knownStartAddrs) {
-        //    Console.WriteLine($"Func start addr: 0x{addr:X}");
-        //}
-
-        // blr: 4e 80 00 20
-
-        //      -name: b
-        //  pattern: 0x48000000
-
-        //- name: bc
-        //  pattern: 0x40000000
-
-        //- name: bcctr
-        //  pattern: 0x4c000420
-
-        //- name: bclr
-        //  pattern: 0x4c000020
-
-        // this is where you try to find function boundaries
-
-        // so when you just have a giant.text section with a bunch of instructions, the most important thing is to determine function boundaries
-        // so CFA in this case means following the instructions control flow(branches, etc)
-        // with mwcc we know any bl target is the start of another function
-        // so we follow the control flow of a function until every path ends in a return (or, sometimes, a tail call)
-        // tail calls make things hard because they're just a b like you'd get with inner-function jumps, but they're actually pointing to a different fn
-        // dunno if you'll have to deal with tail call optimization with msvc 
-
-        // recursively going through and noting down every bl target
-        //the other part is following inner - function branches / jumps to find the end of the function
-        //and also resolving jump tables
+    // debug only: just to check that at the very minimum, we found the function boundaries that the map knows of
+    public void VerifyAgainstMap(XexMap xexMap) {
+        foreach(var entry in xexMap.entries) {
+            if (AddrIsText(entry.vaddr)) {
+                Function func = GetFunction(entry.vaddr);
+                if(func != null && func.addressStart == entry.vaddr) {
+                    // all good!
+                }
+                else {
+                    Console.WriteLine($"WARNING: could not find function at 0x{entry.vaddr:X}");
+                }
+            }
+        }
     }
 
     public byte[] exeBytes;
