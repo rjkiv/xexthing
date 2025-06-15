@@ -71,6 +71,10 @@ class XexPE {
             if(section.Name == ".text") {
                 textSectionIndex = (uint)i;
             }
+            // if this is bss, don't add any extra bytes
+            if (section.SectionCharacteristics.HasFlag(SectionCharacteristics.ContainsUninitializedData)) {
+                continue;
+            }
             Debug.Assert(peAdjusted.Count == section.PointerToRawData, "Unexpected PE size at this point!");
             List<byte> sectionBytes = new();
             for (int j = 0; j < section.SizeOfRawData; j++) {
@@ -262,6 +266,47 @@ class XexPE {
         return addr >= textBegin && addr < textEnd;
     }
 
+    private bool CheckPureCall(BEBinaryReader br) {
+        // we've passed the mfspr at this point
+        var start = br.BaseStream.Position - 4;
+        // is the next inst stw r12, -0x8(r1)?
+        if (br.ReadUInt32() != 0x9181fff8) return false;
+        List<uint> instrsTilReturn = new List<uint>();
+        while (true) {
+            uint inst = br.ReadUInt32();
+            instrsTilReturn.Add(inst);
+            if (PPCHelper.IsBLR(inst)) break;
+        }
+        int mtsprIdx = -1;
+        for(int i = 0; i < instrsTilReturn.Count; i++) {
+            var inst = instrsTilReturn[i];
+            // search the instrs til return for mtspr CTR, rx
+            if ((inst & 0xFC0007FF) == 0x7C0003A6) {
+                mtsprIdx = i;
+                break;
+            }
+        }
+        if (mtsprIdx == -1) return false;
+        // we're checking the next 7 instructions
+        if (mtsprIdx + 7 >= instrsTilReturn.Count) return false;
+        // bctrl
+        if (instrsTilReturn[mtsprIdx + 1] != 0x4e800421) return false;
+        // li r3, 0x19
+        if (instrsTilReturn[mtsprIdx + 2] != 0x38600019) return false;
+        // bl to some target
+        if (!PPCHelper.IsBL(instrsTilReturn[mtsprIdx + 3])) return false;
+        // li r4, 0x1
+        if (instrsTilReturn[mtsprIdx + 4] != 0x38800001) return false;
+        // li r3, 0x0
+        if (instrsTilReturn[mtsprIdx + 5] != 0x38600000) return false;
+        // bl
+        if (!PPCHelper.IsBL(instrsTilReturn[mtsprIdx + 6])) return false;
+        // another bl
+        if (!PPCHelper.IsBL(instrsTilReturn[mtsprIdx + 7])) return false;
+        // if all of these were somehow met, we're most likely dealing with a purecall
+        return true;
+    }
+
     private List<uint> SweepForKnownFuncStartAddrs() {
         HashSet<uint> knownAddrs = new();
         SectionHeader textSection = peSections[(int)textSectionIndex];
@@ -293,8 +338,17 @@ class XexPE {
             }
             // else if this is mfspr r12, LR
             else if(curInst == 0x7D8802A6) {
-                if (knownAddrs.Add(CalcAddrFromRawByteOffset((uint)curPos))) {
-                    //Console.WriteLine($"Added new func start: 0x{CalcAddrFromRawByteOffset((uint)curPos):X}");
+                var justbeforePureCheck = br.BaseStream.Position;
+                if (CheckPureCall(br)) {
+                    //Console.WriteLine($"We found the pure call! it starts at 0x{CalcAddrFromRawByteOffset((uint)curPos):X} and ends at 0x{CalcAddrFromRawByteOffset((uint)br.BaseStream.Position):X}");
+                    Function pureCallFunc = new Function("_purecall", true, CalcAddrFromRawByteOffset((uint)curPos), CalcAddrFromRawByteOffset((uint)br.BaseStream.Position));
+                    AddFunction(pureCallFunc);
+                }
+                else {
+                    br.BaseStream.Seek(justbeforePureCheck, SeekOrigin.Begin);
+                    if (knownAddrs.Add(CalcAddrFromRawByteOffset((uint)curPos))) {
+                        //Console.WriteLine($"Added new func start: 0x{CalcAddrFromRawByteOffset((uint)curPos):X}");
+                    }
                 }
             }
         }
@@ -308,10 +362,30 @@ class XexPE {
         SectionHeader textSection = peSections[(int)textSectionIndex];
         uint textBegin = (uint)textSection.VirtualAddress + imageBase;
         uint textEnd = textBegin + (uint)textSection.VirtualSize;
-        foreach(var knownAddr in knownStartAddrs) {
-            if (knownAddr > addr) return knownAddr;
+
+        uint nextKnownAddr = textEnd;
+
+        // find the first established func whose start address > addr
+        foreach(var func in functionBoundaries) {
+            if(func.addressStart > addr) {
+                nextKnownAddr = func.addressStart;
+                break;
+            }
         }
-        return textEnd;
+
+        // then, search our known start addresses
+        foreach (var knownAddr in knownStartAddrs) {
+            // if we find a known start address that's > addr
+            if (knownAddr > addr) {
+                // if our found knownAddr is smaller than our established nextKnownAddr from the func search
+                if (nextKnownAddr > knownAddr) {
+                    // that's our new smallest next known addr
+                    nextKnownAddr = knownAddr;
+                }
+                break;
+            }
+        }
+        return nextKnownAddr;
     }
 
     private uint FindFunctionEnd(BEBinaryReader br, uint startAddr, uint maxAddr) {
@@ -445,6 +519,10 @@ class XexPE {
         // 1. bl targets
         // 2. any funcs that start with stwu/mfspr, or just mfspr
         knownStartAddrs = SweepForKnownFuncStartAddrs();
+
+        // and then search for func start addrs from vtables
+        // to find a vtable, search for r11 and a combo of lis, addi, and stw addr, 0x0(RX)
+        // go to that address, and mark every entry that is within the .text bounds
 
         BEBinaryReader br = new BEBinaryReader(new MemoryStream(exeBytes));
         SectionHeader textSection = peSections[(int)textSectionIndex];

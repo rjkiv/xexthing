@@ -27,6 +27,7 @@ class XexOptionalHeader {
         kDefaultHeapSize = 0x20401,
         kPageHeapSizeAndFlags = 0x28002,
         kSystemFlags = 0x30000,
+        // extra flag found! 0x30100
         kExecutionID = 0x40006,
         kServiceIDList = 0x401FF,
         kTitleWorkspaceSize = 0x40201,
