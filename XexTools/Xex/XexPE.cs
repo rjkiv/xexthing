@@ -34,8 +34,12 @@ class XexPE {
             return name.Contains("__savefpr") || name.Contains("__restfpr");
         }
 
+        public bool IsVMXIntrinsic() {
+            return name.Contains("__savevmx") || name.Contains("__restvmx");
+        }
+
         public bool IsRegIntrinsic() {
-            return IsGPRIntrinsic() || IsFPRIntrinsic();
+            return IsGPRIntrinsic() || IsFPRIntrinsic() || IsVMXIntrinsic();
         }
 
     }
@@ -199,6 +203,54 @@ class XexPE {
             Function restoreFunc = new Function($"__restfpr_{i}", true, 
                 CalcAddrFromRawByteOffset((uint)theSaveFPRIdx + 0x4C), CalcAddrFromRawByteOffset((uint)theSaveFPRIdx + 0x50));
             AddFunction(saveFunc);
+            AddFunction(restoreFunc);
+        }
+
+        // TODO: find and mark vmx save/restore funcs
+        // the asm corresponding to savevmx's 14-17
+        // stands to reason that if we find these in sequence, the others will be right behind
+        byte[] saveVMXasm = { 0x39, 0x60, 0xfe, 0xe0, 0x7d, 0xcb, 0x61, 0xce, 0x39, 0x60, 0xfe, 0xf0, 0x7d, 0xeb, 0x61, 0xce,
+                              0x39, 0x60, 0xff, 0x00, 0x7e, 0x0b, 0x61, 0xce, 0x39, 0x60, 0xff, 0x10, 0x7e, 0x2b, 0x61, 0xce};
+
+        int theSaveVMXIdx = -1;
+
+        for (int i = section.VirtualAddress; i < (section.VirtualAddress + section.SizeOfRawData) - saveVMXasm.Length; i++) {
+            if (exeBytes.Skip(i).Take(saveVMXasm.Length).SequenceEqual(saveVMXasm)) {
+                theSaveVMXIdx = i;
+                break;
+            }
+        }
+
+        if (theSaveVMXIdx == -1) {
+            throw new Exception("Save vmx compiler intrinsics not found. Is that even possible for an xex?");
+        }
+
+        // the order goes: save 14-31, then 64-127, with each func taking up 8 bytes
+        for(int i = 14; i <= 31; i++, theSaveVMXIdx += 8) {
+            //Console.WriteLine($"Found __savevmx_{i} at 0x{CalcAddrFromRawByteOffset((uint)theSaveVMXIdx):X}");
+            Function saveFunc = new Function($"__savevmx_{i}", true,
+                CalcAddrFromRawByteOffset((uint)theSaveVMXIdx), CalcAddrFromRawByteOffset((uint)theSaveVMXIdx + 8));
+            AddFunction(saveFunc);
+        }
+        theSaveVMXIdx += 4;
+        for (int i = 64; i <= 127; i++, theSaveVMXIdx += 8) {
+            //Console.WriteLine($"Found __savevmx_{i} at 0x{CalcAddrFromRawByteOffset((uint)theSaveVMXIdx):X}");
+            Function saveFunc = new Function($"__savevmx_{i}", true,
+                CalcAddrFromRawByteOffset((uint)theSaveVMXIdx), CalcAddrFromRawByteOffset((uint)theSaveVMXIdx + 8));
+            AddFunction(saveFunc);
+        }
+        theSaveVMXIdx += 4;
+        for (int i = 14; i <= 31; i++, theSaveVMXIdx += 8) {
+            //Console.WriteLine($"Found __restvmx_{i} at 0x{CalcAddrFromRawByteOffset((uint)theSaveVMXIdx):X}");
+            Function restoreFunc = new Function($"__restvmx_{i}", true,
+                CalcAddrFromRawByteOffset((uint)theSaveVMXIdx), CalcAddrFromRawByteOffset((uint)theSaveVMXIdx + 8));
+            AddFunction(restoreFunc);
+        }
+        theSaveVMXIdx += 4;
+        for (int i = 64; i <= 127; i++, theSaveVMXIdx += 8) {
+            //Console.WriteLine($"Found __restvmx_{i} at 0x{CalcAddrFromRawByteOffset((uint)theSaveVMXIdx):X}");
+            Function restoreFunc = new Function($"__restvmx_{i}", true,
+                CalcAddrFromRawByteOffset((uint)theSaveVMXIdx), CalcAddrFromRawByteOffset((uint)theSaveVMXIdx + 8));
             AddFunction(restoreFunc);
         }
     }
@@ -417,6 +469,11 @@ class XexPE {
                 }
                 else if(func.IsFPRIntrinsic()) {
                     Function lastRestoreFunc = GetFunction("__restfpr_31");
+                    br.BaseStream.Seek(lastRestoreFunc.addressEnd - curAddr, SeekOrigin.Current);
+                    continue;
+                }
+                else if (func.IsVMXIntrinsic()) {
+                    Function lastRestoreFunc = GetFunction("__restvmx_127");
                     br.BaseStream.Seek(lastRestoreFunc.addressEnd - curAddr, SeekOrigin.Current);
                     continue;
                 }
