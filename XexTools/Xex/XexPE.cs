@@ -343,8 +343,7 @@ class XexPE {
                             }
                         }
                         else {
-                            //Console.WriteLine($"Next inst: 0x{addr + 4:X}, startAddr: 0x{startAddr:X}, calculated max: 0x{highestAddr + 4:X}");
-                            Console.WriteLine($"Branch at 0x{addr:X} might be a tail call!");
+                            //Console.WriteLine($"Branch at 0x{addr:X} might be a tail call!");
                         }
                     }
                 }
@@ -371,9 +370,17 @@ class XexPE {
         }
 
         //Console.WriteLine($"Func that starts at 0x{startAddr:X}, ends at 0x{highestAddr + 4:X}");
-        // size: highestAddr + 4 - startAddr, jump forward by this much
-        // TODO: do the BR jump here
+        // now that we know where the end is, move the reader ahead up to that point
+        br.BaseStream.Seek(originalPos + (highestAddr + 4 - startAddr), SeekOrigin.Begin);
         return highestAddr + 4;
+    }
+
+    private void DumpFuncs() {
+        string funcsDump = "";
+        foreach (var func in functionBoundaries) {
+            funcsDump += $"{func.name}: 0x{func.addressStart:X} - 0x{func.addressEnd:X}\n";
+        }
+        File.WriteAllText("D:\\DC3 Debug\\Gamepad\\Debug\\jeff_funcs_cfa.txt", funcsDump);
     }
 
     public void FindFunctionBoundaries() {
@@ -383,8 +390,6 @@ class XexPE {
         // 1. bl targets
         // 2. any funcs that start with stwu/mfspr, or just mfspr
         knownStartAddrs = SweepForKnownFuncStartAddrs();
-
-        string funcsDump = "";
 
         BEBinaryReader br = new BEBinaryReader(new MemoryStream(exeBytes));
         SectionHeader textSection = peSections[(int)textSectionIndex];
@@ -402,14 +407,12 @@ class XexPE {
             // ignore the save/restore reg funcs we found earlier
             else if (GetFunction(curAddr) != null) {
                 Function func = GetFunction(curAddr);
-                if (func.name.Contains("__savegprlr") || func.name.Contains("__restgprlr")) {
+                if(func.IsGPRIntrinsic()) {
                     Function lastRestoreFunc = GetFunction("__restgprlr_31");
-                    //Console.WriteLine($"We now want to seek to the end of restgprlr31, 0x{lastRestoreFunc.addressEnd:X}");
-                    //Console.WriteLine($"Since we're currently at 0x{curAddr:X}, we have to seek ahead by 0x{(lastRestoreFunc.addressEnd - curAddr):X} bytes");
                     br.BaseStream.Seek(lastRestoreFunc.addressEnd - curAddr, SeekOrigin.Current);
                     continue;
                 }
-                else if(func.name.Contains("__savefpr") || func.name.Contains("__restfpr")) {
+                else if(func.IsFPRIntrinsic()) {
                     Function lastRestoreFunc = GetFunction("__restfpr_31");
                     br.BaseStream.Seek(lastRestoreFunc.addressEnd - curAddr, SeekOrigin.Current);
                     continue;
@@ -431,16 +434,12 @@ class XexPE {
             uint nextKnownStartAddr = NextKnownStartAddr(curAddr);
             //Console.WriteLine($"The func is from 0x{curAddr:X} til up to 0x{nextKnownStartAddr:X}");
             uint funcEnd = FindFunctionEnd(br, curAddr, nextKnownStartAddr);
-            funcsDump += $"fn_{curAddr:X}: 0x{curAddr:X} - 0x{funcEnd:X}\n";
             AddFunction(new Function($"fn_{curAddr:X}", true, curAddr, funcEnd));
-
-            // now that we know where the func ends, seek to that addr and go again
-            br.BaseStream.Seek(curPos + (funcEnd - curAddr), SeekOrigin.Begin);
         }
 
         Console.WriteLine($"Found {functionBoundaries.Count} functions");
+        DumpFuncs();
 
-        File.WriteAllText("D:\\DC3 Debug\\Gamepad\\Debug\\jeff_funcs_cfa.txt", funcsDump);
         //foreach(var addr in knownStartAddrs) {
         //    Console.WriteLine($"Func start addr: 0x{addr:X}");
         //}
