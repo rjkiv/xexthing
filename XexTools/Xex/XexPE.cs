@@ -330,9 +330,12 @@ class XexPE {
                         else if((addr + 4 == highestAddr + 4) && worklist.Contains(addr + 4)) {
                             // we don't know for sure, so don't do anything
                         }
-                        // if the target is either NOT part of a known function
-                        // OR target is NOT one of our reg compiler intrinsics
-                        else if (GetFunction(target) == null || !GetFunction(target).IsRegIntrinsic()) {
+                        // if the target is part of a known, non-reg intrinsic function, tail call
+                        else if(GetFunction(target) != null && !GetFunction(target).IsRegIntrinsic()) {
+                            break;
+                        }
+                        // if the target is NOT part of a known function
+                        else if (GetFunction(target) == null) {
                             // if the b target is past the known start addr of this func, definitely a tail call
                             if (target < startAddr) {
                                 break;
