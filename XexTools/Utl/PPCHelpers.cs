@@ -35,4 +35,17 @@ public static class PPCHelper {
     public static bool IsBLR(uint instr) {
         return instr == 0x4e800020;
     }
+
+    public static bool IsLIS(uint instr) {
+        if ((instr & 0xFC000000) != 0x3C000000) return false;
+        return (instr & 0xFC1F0000) == 0x3C000000;
+    }
+
+    public static bool IsLFS(uint instr) {
+        return (instr & 0xFC000000) == 0xC0000000;
+    }
+
+    public static bool IsAddi(uint instr) {
+        return (instr & 0xFC000000) == 0x38000000;
+    }
 }

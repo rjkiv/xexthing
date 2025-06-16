@@ -13,12 +13,14 @@ class XexPE {
         public bool analyzed;
         public uint addressStart;
         public uint addressEnd;
+        public bool hasExceptionHandler;
 
-        public Function(string name, bool analyzed, uint addressStart, uint addressEnd) {
+        public Function(string name, bool analyzed, uint addressStart, uint addressEnd, bool hasExceptionHandler) {
             this.name = name;
             this.analyzed = analyzed;
             this.addressStart = addressStart;
             this.addressEnd = addressEnd;
+            this.hasExceptionHandler = hasExceptionHandler;
         }
 
         // note: addr should already be calculated (i.e. not a raw byte offset)
@@ -65,11 +67,15 @@ class XexPE {
             peAdjusted.Add(xexPEImage[i]);
         }
 
+        pDataSectionIndex = -1;
         for (int i = 0; i < headers.SectionHeaders.Length; i++) {
             var section = headers.SectionHeaders[i];
             peSections.Add(section);
             if(section.Name == ".text") {
-                textSectionIndex = (uint)i;
+                textSectionIndex = i;
+            }
+            else if(section.Name == ".pdata") {
+                pDataSectionIndex = i;
             }
             // if this is bss, don't add any extra bytes
             if (section.SectionCharacteristics.HasFlag(SectionCharacteristics.ContainsUninitializedData)) {
@@ -90,7 +96,7 @@ class XexPE {
     }
 
     private void AddFunction(Function func) {
-        // make sure a function with the raw byte start idx isn't already in here
+        // make sure a function with the start address isn't already in here
         int index = functionBoundaries.BinarySearch(func, Comparer<Function>.Create((x, y) => x.addressStart.CompareTo(y.addressStart)));
 
         if (index >= 0) return;
@@ -100,11 +106,15 @@ class XexPE {
         functionBoundaries.Insert(index, func);
     }
 
-    private Function GetFunction(uint addr) {
+    private Function GetFunctionFromBounds(uint addr) {
         return functionBoundaries.Find(x => addr >= x.addressStart && addr < x.addressEnd);
     }
 
-    private Function GetFunction(string name) {
+    private Function GetFunctionFromStartAddr(uint addr) {
+        return functionBoundaries.Find(x => addr == x.addressStart);
+    }
+
+    private Function GetFunctionFromName(string name) {
         return functionBoundaries.Find(x => x.name == name);
     }
 
@@ -166,7 +176,7 @@ class XexPE {
 
         int theSaveGPRIdx = -1;
 
-        SectionHeader section = peSections[(int)textSectionIndex];
+        SectionHeader section = peSections[textSectionIndex];
 
         for(int i = section.VirtualAddress; i < (section.VirtualAddress + section.SizeOfRawData) - saveGPRasm.Length; i++) {
             if (exeBytes.Skip(i).Take(saveGPRasm.Length).SequenceEqual(saveGPRasm)) {
@@ -181,9 +191,9 @@ class XexPE {
 
         for(int i = 14; i <= 31; i++, theSaveGPRIdx += 4) {
             Function saveFunc = new Function($"__savegprlr_{i}", true,
-                CalcAddrFromRawByteOffset((uint)theSaveGPRIdx), CalcAddrFromRawByteOffset((uint)theSaveGPRIdx + 4));
+                CalcAddrFromRawByteOffset((uint)theSaveGPRIdx), CalcAddrFromRawByteOffset((uint)theSaveGPRIdx + 4), true);
             Function restoreFunc = new Function($"__restgprlr_{i}", true,
-                CalcAddrFromRawByteOffset((uint)theSaveGPRIdx + 0x50), CalcAddrFromRawByteOffset((uint)theSaveGPRIdx + 0x54));
+                CalcAddrFromRawByteOffset((uint)theSaveGPRIdx + 0x50), CalcAddrFromRawByteOffset((uint)theSaveGPRIdx + 0x54), true);
             AddFunction(saveFunc);
             AddFunction(restoreFunc);
         }
@@ -203,9 +213,9 @@ class XexPE {
 
         for (int i = 14; i <= 31; i++, theSaveFPRIdx += 4) {
             Function saveFunc = new Function($"__savefpr_{i}", true, 
-                CalcAddrFromRawByteOffset((uint)theSaveFPRIdx), CalcAddrFromRawByteOffset((uint)theSaveFPRIdx + 4));
+                CalcAddrFromRawByteOffset((uint)theSaveFPRIdx), CalcAddrFromRawByteOffset((uint)theSaveFPRIdx + 4), true);
             Function restoreFunc = new Function($"__restfpr_{i}", true, 
-                CalcAddrFromRawByteOffset((uint)theSaveFPRIdx + 0x4C), CalcAddrFromRawByteOffset((uint)theSaveFPRIdx + 0x50));
+                CalcAddrFromRawByteOffset((uint)theSaveFPRIdx + 0x4C), CalcAddrFromRawByteOffset((uint)theSaveFPRIdx + 0x50), true);
             AddFunction(saveFunc);
             AddFunction(restoreFunc);
         }
@@ -233,34 +243,34 @@ class XexPE {
         for(int i = 14; i <= 31; i++, theSaveVMXIdx += 8) {
             //Console.WriteLine($"Found __savevmx_{i} at 0x{CalcAddrFromRawByteOffset((uint)theSaveVMXIdx):X}");
             Function saveFunc = new Function($"__savevmx_{i}", true,
-                CalcAddrFromRawByteOffset((uint)theSaveVMXIdx), CalcAddrFromRawByteOffset((uint)theSaveVMXIdx + 8));
+                CalcAddrFromRawByteOffset((uint)theSaveVMXIdx), CalcAddrFromRawByteOffset((uint)theSaveVMXIdx + 8), true);
             AddFunction(saveFunc);
         }
         theSaveVMXIdx += 4;
         for (int i = 64; i <= 127; i++, theSaveVMXIdx += 8) {
             //Console.WriteLine($"Found __savevmx_{i} at 0x{CalcAddrFromRawByteOffset((uint)theSaveVMXIdx):X}");
             Function saveFunc = new Function($"__savevmx_{i}", true,
-                CalcAddrFromRawByteOffset((uint)theSaveVMXIdx), CalcAddrFromRawByteOffset((uint)theSaveVMXIdx + 8));
+                CalcAddrFromRawByteOffset((uint)theSaveVMXIdx), CalcAddrFromRawByteOffset((uint)theSaveVMXIdx + 8), true);
             AddFunction(saveFunc);
         }
         theSaveVMXIdx += 4;
         for (int i = 14; i <= 31; i++, theSaveVMXIdx += 8) {
             //Console.WriteLine($"Found __restvmx_{i} at 0x{CalcAddrFromRawByteOffset((uint)theSaveVMXIdx):X}");
             Function restoreFunc = new Function($"__restvmx_{i}", true,
-                CalcAddrFromRawByteOffset((uint)theSaveVMXIdx), CalcAddrFromRawByteOffset((uint)theSaveVMXIdx + 8));
+                CalcAddrFromRawByteOffset((uint)theSaveVMXIdx), CalcAddrFromRawByteOffset((uint)theSaveVMXIdx + 8), true);
             AddFunction(restoreFunc);
         }
         theSaveVMXIdx += 4;
         for (int i = 64; i <= 127; i++, theSaveVMXIdx += 8) {
             //Console.WriteLine($"Found __restvmx_{i} at 0x{CalcAddrFromRawByteOffset((uint)theSaveVMXIdx):X}");
             Function restoreFunc = new Function($"__restvmx_{i}", true,
-                CalcAddrFromRawByteOffset((uint)theSaveVMXIdx), CalcAddrFromRawByteOffset((uint)theSaveVMXIdx + 8));
+                CalcAddrFromRawByteOffset((uint)theSaveVMXIdx), CalcAddrFromRawByteOffset((uint)theSaveVMXIdx + 8), true);
             AddFunction(restoreFunc);
         }
     }
 
     private bool AddrIsText(uint addr) {
-        SectionHeader textSection = peSections[(int)textSectionIndex];
+        SectionHeader textSection = peSections[textSectionIndex];
         uint textBegin = (uint)textSection.VirtualAddress + imageBase;
         uint textEnd = textBegin + (uint)textSection.VirtualSize;
         return addr >= textBegin && addr < textEnd;
@@ -309,7 +319,7 @@ class XexPE {
 
     private List<uint> SweepForKnownFuncStartAddrs() {
         HashSet<uint> knownAddrs = new();
-        SectionHeader textSection = peSections[(int)textSectionIndex];
+        SectionHeader textSection = peSections[textSectionIndex];
         uint textBegin = (uint)textSection.VirtualAddress + imageBase;
         uint textEnd = textBegin + (uint)textSection.VirtualSize;
 
@@ -322,35 +332,11 @@ class XexPE {
             // if this is a bl, note down the branch target
             if (PPCHelper.IsBL(curInst)) {
                 uint branchTarget = CalculateBranchTarget((uint)curPos, curInst);
-                if(branchTarget >= textBegin && branchTarget < textEnd && knownAddrs.Add(branchTarget)) {
-                    //Console.WriteLine($"Added new func start: 0x{branchTarget:X}");
+                if(branchTarget >= textBegin && branchTarget < textEnd && GetFunctionFromBounds(branchTarget) == null && knownAddrs.Add(branchTarget)) {
+                    //Console.WriteLine($"Added new func start (branch target): 0x{branchTarget:X}");
                 }
             }
-            // else, if this is subi r31, r12, XXXX
-            else if((curInst & 0xFC1F8000) == 0x3F8C000) {
-                uint mfsprCheck = br.PeekUInt32();
-                // and if the next instr is mfspr r12, LR
-                if(mfsprCheck == 0x7D8802A6) {
-                    if(knownAddrs.Add(CalcAddrFromRawByteOffset((uint)curPos))) {
-                        //Console.WriteLine($"Added new func start: 0x{CalcAddrFromRawByteOffset((uint)curPos):X}");
-                    }
-                }
-            }
-            // else if this is mfspr r12, LR
-            else if(curInst == 0x7D8802A6) {
-                var justbeforePureCheck = br.BaseStream.Position;
-                if (CheckPureCall(br)) {
-                    //Console.WriteLine($"We found the pure call! it starts at 0x{CalcAddrFromRawByteOffset((uint)curPos):X} and ends at 0x{CalcAddrFromRawByteOffset((uint)br.BaseStream.Position):X}");
-                    Function pureCallFunc = new Function("_purecall", true, CalcAddrFromRawByteOffset((uint)curPos), CalcAddrFromRawByteOffset((uint)br.BaseStream.Position));
-                    AddFunction(pureCallFunc);
-                }
-                else {
-                    br.BaseStream.Seek(justbeforePureCheck, SeekOrigin.Begin);
-                    if (knownAddrs.Add(CalcAddrFromRawByteOffset((uint)curPos))) {
-                        //Console.WriteLine($"Added new func start: 0x{CalcAddrFromRawByteOffset((uint)curPos):X}");
-                    }
-                }
-            }
+            // no need to search for function prologues, since .pdata seems to have those covered!
         }
 
         List<uint> sortedAddrs = knownAddrs.ToList();
@@ -359,7 +345,7 @@ class XexPE {
     }
 
     private uint NextKnownStartAddr(uint addr) {
-        SectionHeader textSection = peSections[(int)textSectionIndex];
+        SectionHeader textSection = peSections[textSectionIndex];
         uint textBegin = (uint)textSection.VirtualAddress + imageBase;
         uint textEnd = textBegin + (uint)textSection.VirtualSize;
 
@@ -392,7 +378,7 @@ class XexPE {
         var worklist = new Queue<uint>();
         var visited = new HashSet<uint>();
         uint highestAddr = startAddr;
-        SectionHeader textSection = peSections[(int)textSectionIndex];
+        SectionHeader textSection = peSections[textSectionIndex];
         uint textSectionBegin = (uint)textSection.VirtualAddress + imageBase;
         uint textSectionEnd = textSectionBegin + (uint)textSection.SizeOfRawData;
         var originalPos = br.BaseStream.Position; // the position in the BR corresponding to the start of the func
@@ -457,11 +443,11 @@ class XexPE {
                             // we don't know for sure, so don't do anything
                         }
                         // if the target is part of a known, non-reg intrinsic function, tail call
-                        else if(GetFunction(target) != null && !GetFunction(target).IsRegIntrinsic()) {
+                        else if(GetFunctionFromBounds(target) != null && !GetFunctionFromBounds(target).IsRegIntrinsic()) {
                             break;
                         }
                         // if the target is NOT part of a known function
-                        else if (GetFunction(target) == null) {
+                        else if (GetFunctionFromBounds(target) == null) {
                             // if the b target is past the known start addr of this func, definitely a tail call
                             if (target < startAddr) {
                                 break;
@@ -512,20 +498,52 @@ class XexPE {
         File.WriteAllText("D:\\DC3 Debug\\Gamepad\\Debug\\jeff_funcs_cfa.txt", funcsDump);
     }
 
+    public void BrowsePData() {
+        if(pDataSectionIndex == -1) {
+            throw new Exception(".pdata section not found. Is that even possible for an xex?");
+        }
+
+        SectionHeader pDataSection = peSections[pDataSectionIndex];
+        BEBinaryReader br = new BEBinaryReader(new MemoryStream(exeBytes));
+        br.BaseStream.Seek(pDataSection.PointerToRawData, SeekOrigin.Begin);
+        Console.WriteLine($".pdata begins at 0x{CalcAddrFromRawByteOffset((uint)pDataSection.PointerToRawData):X}");
+        while(br.BaseStream.Position < pDataSection.PointerToRawData + pDataSection.SizeOfRawData) {
+            uint beginAddr = br.ReadUInt32();
+            if (beginAddr == 0) break; // if we encounter 0's, that's the end of usable pdata entries
+            uint theRest = br.ReadUInt32();
+
+            uint numPrologueInsts = theRest & 0xFF;
+            uint numInstsInFunc = (theRest >> 8) & 0x3FFFFF;
+            bool flag32Bit = (theRest & 0x4000) != 0;
+            bool exceptionFlag = (theRest & 0x8000) != 0;
+
+            // if we encounter the save/restore reg intrinsics, we don't need to worry
+            // because AddFunction checks for duplicate start addresses and disregards them
+            AddFunction(new Function($"fn_{beginAddr:X}", false, beginAddr, beginAddr + (numInstsInFunc * 4), exceptionFlag));
+
+            //Console.WriteLine($"Func found: 0x{beginAddr:X} - 0x{beginAddr + (numInstsInFunc * 4):X}");
+        }
+    }
+
     public void FindFunctionBoundaries() {
+        // new iteration:
+        // sweep to find XAPI calls too! starting with XamInputGetCapabilities: e.g. 0x01000190020001907d6903a64e800420
+
         // initial sweep to find and label the save/restore reg funcs
         FindSaveAndRestoreRegisterFuncs();
-        // do a sweep to find known start addresses from
-        // 1. bl targets
-        // 2. any funcs that start with stwu/mfspr, or just mfspr
+        // go through .pdata and add Function entries for each one you find
+        BrowsePData();
+        // do a sweep to find any still-unaccounted-for func start addresses
         knownStartAddrs = SweepForKnownFuncStartAddrs();
 
         // and then search for func start addrs from vtables
         // to find a vtable, search for r11 and a combo of lis, addi, and stw addr, 0x0(RX)
         // go to that address, and mark every entry that is within the .text bounds
+        // TODO: if we have a map, add those start addresses too
 
+        // perform CFA on any remaining necessary funcs
         BEBinaryReader br = new BEBinaryReader(new MemoryStream(exeBytes));
-        SectionHeader textSection = peSections[(int)textSectionIndex];
+        SectionHeader textSection = peSections[textSectionIndex];
         br.BaseStream.Seek(textSection.PointerToRawData, SeekOrigin.Begin);
         while(br.BaseStream.Position < textSection.PointerToRawData + textSection.SizeOfRawData) {
             // note current PC and virtual addr
@@ -537,22 +555,27 @@ class XexPE {
                 br.BaseStream.Seek(4, SeekOrigin.Current);
                 continue;
             }
-            // ignore the save/restore reg funcs we found earlier
-            else if (GetFunction(curAddr) != null) {
-                Function func = GetFunction(curAddr);
+            // ignore the funcs we found earlier
+            else if (GetFunctionFromBounds(curAddr) != null) {
+                Function func = GetFunctionFromBounds(curAddr);
+                //Console.WriteLine($"Encountered {func.name} at {curAddr:X}, skipping forward to...0x{func.addressEnd:X}");
                 if(func.IsGPRIntrinsic()) {
-                    Function lastRestoreFunc = GetFunction("__restgprlr_31");
+                    Function lastRestoreFunc = GetFunctionFromName("__restgprlr_31");
                     br.BaseStream.Seek(lastRestoreFunc.addressEnd - curAddr, SeekOrigin.Current);
                     continue;
                 }
                 else if(func.IsFPRIntrinsic()) {
-                    Function lastRestoreFunc = GetFunction("__restfpr_31");
+                    Function lastRestoreFunc = GetFunctionFromName("__restfpr_31");
                     br.BaseStream.Seek(lastRestoreFunc.addressEnd - curAddr, SeekOrigin.Current);
                     continue;
                 }
                 else if (func.IsVMXIntrinsic()) {
-                    Function lastRestoreFunc = GetFunction("__restvmx_127");
+                    Function lastRestoreFunc = GetFunctionFromName("__restvmx_127");
                     br.BaseStream.Seek(lastRestoreFunc.addressEnd - curAddr, SeekOrigin.Current);
+                    continue;
+                }
+                else {
+                    br.BaseStream.Seek(func.addressEnd - curAddr, SeekOrigin.Current);
                     continue;
                 }
             }
@@ -572,7 +595,7 @@ class XexPE {
             uint nextKnownStartAddr = NextKnownStartAddr(curAddr);
             //Console.WriteLine($"The func is from 0x{curAddr:X} til up to 0x{nextKnownStartAddr:X}");
             uint funcEnd = FindFunctionEnd(br, curAddr, nextKnownStartAddr);
-            AddFunction(new Function($"fn_{curAddr:X}", true, curAddr, funcEnd));
+            AddFunction(new Function($"fn_{curAddr:X}", true, curAddr, funcEnd, false));
         }
 
         Console.WriteLine($"Found {functionBoundaries.Count} functions");
@@ -584,8 +607,8 @@ class XexPE {
     public void VerifyAgainstMap(XexMap xexMap) {
         foreach(var entry in xexMap.entries) {
             if (AddrIsText(entry.vaddr)) {
-                Function func = GetFunction(entry.vaddr);
-                if(func != null && func.addressStart == entry.vaddr) {
+                Function func = GetFunctionFromStartAddr(entry.vaddr);
+                if(func != null) {
                     // all good!
                 }
                 else {
@@ -598,7 +621,8 @@ class XexPE {
     public byte[] exeBytes;
     public uint entryPointAddress;
     public uint imageBase;
-    public uint textSectionIndex;
+    public int pDataSectionIndex;
+    public int textSectionIndex;
     public List<uint> knownStartAddrs = new();
     public List<SectionHeader> peSections = new();
     public List<Function> functionBoundaries = new();
