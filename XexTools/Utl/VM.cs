@@ -93,10 +93,6 @@ public class Function {
 
         uint possibleJumpTableMask = 0;
 
-        if(addressStart == 0x821a5720) {
-
-        }
-
         uint addr = addressStart;
         for(; addr < addressEnd; addr += 4) {
             uint instr = br.ReadUInt32();
@@ -116,6 +112,8 @@ public class Function {
                 var bInst = disasm.Disassemble(instBytes, addr)[0];
                 char[] remove = ['+', '-']; // we don't care about speculative branch direction
                 string mnemonic = bInst.Mnemonic.TrimEnd(remove);
+                // why not a switch case? because some of these cases require breaking out of the while loop
+                // and that's kinda hard to do when switch statements inherently have breaks
                 if(mnemonic == "bdnz" || mnemonic == "bdz" ||
                     mnemonic == "bdzf" || mnemonic == "bdnzf" ||
                     mnemonic == "bge" || mnemonic == "bgt" ||
@@ -149,6 +147,14 @@ public class Function {
                             addr += 4;
                             if (PPCHelper.IsBLR(br.PeekUInt32())) addr += 4; // evil hack to make it end after the blr if the next inst is a blr
                             break;
+                            // TODO: integrate logic for continuing on anyway if we know the addr from pdata
+                            //if (knownFromPData && addressEnd != addr + 4) {
+                            //    basicBlockBounds.Add(addr + 4);
+                            //    continue;
+                            //}
+                            //else {
+                            //    addr += 4; break;
+                            //}
                         }
                     }
                 }
@@ -176,7 +182,13 @@ public class Function {
                         // if there are no more established basic block bounds that are > this address, it IS a tail call
                         uint? firstGreaterBound = basicBlockBounds.FirstOrDefault(x => x > addr);
                         if (firstGreaterBound == 0) {
-                            addr += 4; break;
+                            if(knownFromPData && addressEnd != addr + 4) {
+                                basicBlockBounds.Add(addr + 4);
+                                continue;
+                            }
+                            else {
+                                addr += 4; break;
+                            }
                         }
                         else {
                             // any other logic to determine tail calls goes here
@@ -188,10 +200,17 @@ public class Function {
                     // if there are no more established basic block bounds that are > this address, it IS a tail call
                     uint? firstGreaterBound = basicBlockBounds.FirstOrDefault(x => x > addr);
                     if (firstGreaterBound == 0) {
-                        addr += 4; break;
+                        // if(knownFromPData && addressEnd != addr + 4) don't break, instead add addr + 4 to the basic block bounds
+                        // else, addr += 4 and break
+                        //addr += 4; break;
+                        if (knownFromPData && addressEnd != addr + 4) {
+                            basicBlockBounds.Add(addr + 4);
+                            continue;
+                        }
+                        else {
+                            addr += 4; break;
+                        }
                     }
-                    //addr += 4;
-                    //break; // (should we do this? i *think* in some switch cases there may be multiple blrs)
                 }
                 else throw new Exception($"Unhandled branch instruction {mnemonic}!");
             }

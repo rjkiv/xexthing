@@ -142,16 +142,20 @@ class XexPE {
 
     private void DumpFuncs(bool includePdata) {
         string funcsDump = "";
+        int dumpCount = 0;
         foreach (var func in functionBoundaries) {
             if (func.knownFromPData) {
                 if (!includePdata) continue;
                 funcsDump += $"{func.name}: 0x{func.addressStart:X} - 0x{func.addressEnd:X} (pdata)\n";
+                dumpCount++;
             }
             else {
                 funcsDump += $"{func.name}: 0x{func.addressStart:X} - 0x{func.addressEnd:X}\n";
+                dumpCount++;
             }
         }
         File.WriteAllText("D:\\DC3 Debug\\Gamepad\\Debug\\jeff_funcs.txt", funcsDump);
+        Console.WriteLine($"Dumped {dumpCount} of {functionBoundaries.Count} total functions");
     }
 
     private void BrowsePData() {
