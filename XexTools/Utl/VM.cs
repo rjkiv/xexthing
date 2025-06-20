@@ -92,11 +92,13 @@ public class Function {
         // once you've got them, assemble them and mark down successors
 
         uint possibleJumpTableMask = 0;
+        bool shouldBreakNow = false;
 
         uint addr = addressStart;
         for(; addr < addressEnd; addr += 4) {
             uint instr = br.ReadUInt32();
             if (instr == 0) break; // ignore zero-padding
+            if (shouldBreakNow) break;
 
             // if cmplwi, this is possibly the first of a sequence of jump table bytes
             if ((instr & 0xFC000000) == 0x28000000) possibleJumpTableMask |= 1;
@@ -112,107 +114,113 @@ public class Function {
                 var bInst = disasm.Disassemble(instBytes, addr)[0];
                 char[] remove = ['+', '-']; // we don't care about speculative branch direction
                 string mnemonic = bInst.Mnemonic.TrimEnd(remove);
-                // why not a switch case? because some of these cases require breaking out of the while loop
-                // and that's kinda hard to do when switch statements inherently have breaks
-                if(mnemonic == "bdnz" || mnemonic == "bdz" ||
-                    mnemonic == "bdzf" || mnemonic == "bdnzf" ||
-                    mnemonic == "bge" || mnemonic == "bgt" ||
-                    mnemonic == "bne" || mnemonic == "beq" ||
-                    mnemonic == "ble" || mnemonic == "blt") {
-                    if (mnemonic == "bgt" && (possibleJumpTableMask & 1) == 1) possibleJumpTableMask |= 2;
-                    // new bounds: the target, and the fallthrough
-                    uint target = (uint)bInst.Details.Operands[bInst.Details.Operands.Length - 1].Immediate;
-                    basicBlockBounds.Add(target);
-                    basicBlockBounds.Add(addr + 4);
-                    branchPaths[addr] = new List<uint> { target, addr + 4 };
-                }
-                else if(mnemonic == "bl" || mnemonic == "bctrl") {
-                    // we only want the fallthrough
-                    basicBlockBounds.Add(addr + 4);
-                }
-                else if(mnemonic == "blelr" || mnemonic == "beqlr" || mnemonic == "bltlr" || mnemonic == "bnelr" || mnemonic == "bgelr" || mnemonic == "bdzlr" || mnemonic == "bgtlr") {
-                    basicBlockBounds.Add(addr + 4);
-                }
-                else if(mnemonic == "bctr") {
-                    if(possibleJumpTableMask == 15) {
-                        possibleJumpTableMask = 0;
-                        possibleJumpTable = true;
-                        basicBlockBounds.Add(addr + 4);
-                    }
-                    // if not a possible jump table, this is the end
-                    // if there are no more established basic block bounds that are > this address, it IS a tail call
-                    else {
-                        uint? firstGreaterBound = basicBlockBounds.FirstOrDefault(x => x > addr);
-                        if(firstGreaterBound == 0) {
-                            addr += 4;
-                            if (PPCHelper.IsBLR(br.PeekUInt32())) addr += 4; // evil hack to make it end after the blr if the next inst is a blr
-                            break;
-                            // TODO: integrate logic for continuing on anyway if we know the addr from pdata
-                            //if (knownFromPData && addressEnd != addr + 4) {
-                            //    basicBlockBounds.Add(addr + 4);
-                            //    continue;
-                            //}
-                            //else {
-                            //    addr += 4; break;
-                            //}
-                        }
-                    }
-                }
-                else if(mnemonic == "bnectr") {
-                    // anything special to do here?
-                }
-                else if(mnemonic == "b") {
-                    if(br.PeekUInt32() == 0) { // if the next inst is 0
-                        continue; // because the next iteration of the loop will catch that 0 and mark the end of this function
-                    }
 
-                    uint target = (uint)bInst.Details.Operands[bInst.Details.Operands.Length - 1].Immediate;
-                    // if the target is within the bounds of this function, add it to our bounds
-                    if (target >= addressStart && target < addressEnd) {
+                switch (mnemonic) {
+                    case "bdnz": case "bdz": case "bdzf": case "bdnzf":
+                    case "bge": case "bgt":
+                    case "bne": case "beq":
+                    case "ble": case "blt": {
+                        if (mnemonic == "bgt" && (possibleJumpTableMask & 1) == 1) possibleJumpTableMask |= 2;
+                        // new bounds: the target, and the fallthrough
+                        uint target = (uint)bInst.Details.Operands[bInst.Details.Operands.Length - 1].Immediate;
                         basicBlockBounds.Add(target);
-                        // although not a fallthrough, if the target went down, this does mark the start of a new block
-                        if(target > addr) basicBlockBounds.Add(addr + 4);
-                        branchPaths[addr] = new List<uint> { target };
-                    }
-                    // if the target is outside the bounds of this function and it's NOT a reg intrinsic, it's a tail call
-                    if((target < addressStart || target > addressEnd) && !IsRegIntrinsic(target)){
-                        addr += 4; break;
-                    }
-                    else {
+                        basicBlockBounds.Add(addr + 4);
+                        branchPaths[addr] = new List<uint> { target, addr + 4 };
+                    }    break;
+                    case "bl":
+                    case "bctrl":
+                        // we only want the fallthrough
+                        basicBlockBounds.Add(addr + 4);
+                        break;
+                    // should we do anything different for these?
+                    case "blelr": case "bltlr":
+                    case "beqlr": case "bnelr":
+                    case "bgelr": case "bgtlr":
+                    case "bdzlr":
+                        basicBlockBounds.Add(addr + 4);
+                        break;
+                    case "bctr":
+                        if (possibleJumpTableMask == 15) {
+                            possibleJumpTableMask = 0;
+                            possibleJumpTable = true;
+                            basicBlockBounds.Add(addr + 4);
+                        }
+                        // if not a possible jump table, this is the end
+                        // if there are no more established basic block bounds that are > this address, it IS a tail call
+                        else {
+                            uint? firstGreaterBound = basicBlockBounds.FirstOrDefault(x => x > addr);
+                            if (firstGreaterBound == 0) {
+                                if (PPCHelper.IsBLR(br.PeekUInt32())) addr += 4; // evil hack to make it end after the blr if the next inst is a blr
+                                if (knownFromPData && addressEnd != addr + 4) {
+                                    basicBlockBounds.Add(addr + 4);
+                                    continue;
+                                }
+                                else {
+                                    shouldBreakNow = true;
+                                }
+                            }
+                        }
+                        break;
+                    case "bnectr": // anything special to do here?
+                        break;
+                    case "b": {
+                        if (br.PeekUInt32() == 0) { // if the next inst is 0
+                            shouldBreakNow = true;
+                            continue; // because the next iteration of the loop will catch that 0 and mark the end of this function
+                        }
+
+                        uint target = (uint)bInst.Details.Operands[bInst.Details.Operands.Length - 1].Immediate;
+                        // if the target is within the bounds of this function, add it to our bounds
+                        if (target >= addressStart && target < addressEnd) {
+                            basicBlockBounds.Add(target);
+                            // although not a fallthrough, if the target went down, this does mark the start of a new block
+                            if (target > addr) basicBlockBounds.Add(addr + 4);
+                            branchPaths[addr] = new List<uint> { target };
+                        }
+                        // if the target is outside the bounds of this function and it's NOT a reg intrinsic, it's a tail call
+                        if ((target < addressStart || target > addressEnd) && !IsRegIntrinsic(target)) {
+                            shouldBreakNow = true;
+                            continue;
+                        }
+                        else {
+                            // if there are no more established basic block bounds that are > this address, it IS a tail call
+                            uint? firstGreaterBound = basicBlockBounds.FirstOrDefault(x => x > addr);
+                            if (firstGreaterBound == 0) {
+                                if (knownFromPData && addressEnd != addr + 4) {
+                                    basicBlockBounds.Add(addr + 4);
+                                    continue;
+                                }
+                                else {
+                                    shouldBreakNow = true;
+                                    continue;
+                                }
+                            }
+                            else {
+                                // any other logic to determine tail calls goes here
+                                // currently, if this branch is reached, it's treated as NOT a tail call
+                            }
+                        }
+                    }  break;
+                    case "blr": case "blrl": {
                         // if there are no more established basic block bounds that are > this address, it IS a tail call
                         uint? firstGreaterBound = basicBlockBounds.FirstOrDefault(x => x > addr);
                         if (firstGreaterBound == 0) {
-                            if(knownFromPData && addressEnd != addr + 4) {
+                            // if(knownFromPData && addressEnd != addr + 4) don't break, instead add addr + 4 to the basic block bounds
+                            // else, addr += 4 and break
+                            //addr += 4; break;
+                            if (knownFromPData && addressEnd != addr + 4) {
                                 basicBlockBounds.Add(addr + 4);
                                 continue;
                             }
                             else {
-                                addr += 4; break;
+                                shouldBreakNow = true;
+                                continue;
                             }
                         }
-                        else {
-                            // any other logic to determine tail calls goes here
-                            // currently, if this branch is reached, it's treated as NOT a tail call
-                        }
-                    }
+                    } break;
+                    default:
+                        throw new Exception($"Unhandled branch instruction {mnemonic}!");
                 }
-                else if(mnemonic == "blr" || mnemonic == "blrl") {
-                    // if there are no more established basic block bounds that are > this address, it IS a tail call
-                    uint? firstGreaterBound = basicBlockBounds.FirstOrDefault(x => x > addr);
-                    if (firstGreaterBound == 0) {
-                        // if(knownFromPData && addressEnd != addr + 4) don't break, instead add addr + 4 to the basic block bounds
-                        // else, addr += 4 and break
-                        //addr += 4; break;
-                        if (knownFromPData && addressEnd != addr + 4) {
-                            basicBlockBounds.Add(addr + 4);
-                            continue;
-                        }
-                        else {
-                            addr += 4; break;
-                        }
-                    }
-                }
-                else throw new Exception($"Unhandled branch instruction {mnemonic}!");
             }
         }
 
