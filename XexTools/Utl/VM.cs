@@ -93,6 +93,10 @@ public class Function {
 
         uint possibleJumpTableMask = 0;
 
+        if(addressStart == 0x821a5720) {
+
+        }
+
         uint addr = addressStart;
         for(; addr < addressEnd; addr += 4) {
             uint instr = br.ReadUInt32();
@@ -160,13 +164,12 @@ public class Function {
                     // if the target is within the bounds of this function, add it to our bounds
                     if (target >= addressStart && target < addressEnd) {
                         basicBlockBounds.Add(target);
-                        // although not a fallthrough, this does mark the start of a new block
-                        basicBlockBounds.Add(addr + 4);
+                        // although not a fallthrough, if the target went down, this does mark the start of a new block
+                        if(target > addr) basicBlockBounds.Add(addr + 4);
                         branchPaths[addr] = new List<uint> { target };
                     }
-
-                    // if the target is NOT a reg intrinsic, it's a tail call
-                    if(!IsRegIntrinsic(target)){
+                    // if the target is outside the bounds of this function and it's NOT a reg intrinsic, it's a tail call
+                    if((target < addressStart || target > addressEnd) && !IsRegIntrinsic(target)){
                         addr += 4; break;
                     }
                     else {
@@ -177,6 +180,7 @@ public class Function {
                         }
                         else {
                             // any other logic to determine tail calls goes here
+                            // currently, if this branch is reached, it's treated as NOT a tail call
                         }
                     }
                 }
