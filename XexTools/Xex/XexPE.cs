@@ -272,6 +272,7 @@ class XexPE {
         CreateSpeculativeFunctions();
         BreakFuncsDownIntoBlocks();
         DumpFuncs();
+        VerifyAgainstPData();
     }
 
     // debug only: just to check that at the very minimum, we found the function boundaries that the map knows of
@@ -285,6 +286,38 @@ class XexPE {
                 else {
                     Console.WriteLine($"WARNING: could not find function at 0x{entry.vaddr:X}");
                 }
+            }
+        }
+    }
+
+    public void VerifyAgainstPData() {
+        if (pDataSectionIndex == -1)
+            throw new Exception(".pdata section not found. Is that even possible for an xex?");
+
+        SectionHeader pDataSection = peSections[pDataSectionIndex];
+        BEBinaryReader br = new BEBinaryReader(new MemoryStream(exeBytes));
+        br.BaseStream.Seek(pDataSection.PointerToRawData, SeekOrigin.Begin);
+        //Console.WriteLine($".pdata begins at 0x{CalcAddrFromRawByteOffset((uint)pDataSection.PointerToRawData):X}");
+        while (br.BaseStream.Position < pDataSection.PointerToRawData + pDataSection.SizeOfRawData) {
+            uint beginAddr = br.ReadUInt32();
+            if (beginAddr == 0) break; // if we encounter 0's, that's the end of usable pdata entries
+            uint theRest = br.ReadUInt32();
+
+            uint numPrologueInsts = theRest & 0xFF;
+            uint numInstsInFunc = (theRest >> 8) & 0x3FFFFF;
+            bool flag32Bit = (theRest & 0x4000) != 0;
+            bool exceptionFlag = (theRest & 0x8000) != 0;
+
+            Function? function = GetFunctionFromStartAddr(beginAddr);
+            Debug.Assert(function != null, $"Function starting at 0x{beginAddr:X} has been tampered with!");
+            if (!Function.IsRegIntrinsic(beginAddr)) {
+                Debug.Assert(function.addressEnd == beginAddr + (numInstsInFunc * 4),
+                    $"Function starting at 0x{beginAddr:X} should end at 0x{beginAddr + (numInstsInFunc * 4):X}, but instead, it now ends at 0x{function.addressEnd:X}!");
+            }
+
+            // using a sorted set to not worry about duplicates (like the reg intrinsics or XAPI calls)
+            if (functionBoundaries.Add(new Function(beginAddr, beginAddr + (numInstsInFunc * 4), exceptionFlag))) {
+                //Console.WriteLine($"Func found: 0x{beginAddr:X} - 0x{beginAddr + (numInstsInFunc * 4):X}");
             }
         }
     }

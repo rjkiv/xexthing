@@ -33,6 +33,7 @@ public class Function {
     // the exception flag in .pdata. if this func is not in .pdata, this should be false
     public bool hasExceptionHandler;
 
+    public bool knownFromPData;
     public bool possibleJumpTable;
 
     //List<BasicBlock> basicBlocks = new List<BasicBlock> ();
@@ -57,6 +58,7 @@ public class Function {
         addressEnd = end;
         hasExceptionHandler = false;
         possibleJumpTable = false;
+        knownFromPData = false;
         if (name == "") this.name = $"fn_{addressStart:X}";
         else this.name = name;
     }
@@ -67,6 +69,7 @@ public class Function {
         addressEnd = end;
         hasExceptionHandler = hasHandler;
         possibleJumpTable = false;
+        knownFromPData = true;
         if (name == "") this.name = $"fn_{addressStart:X}";
         else this.name = name;
     }
@@ -161,8 +164,9 @@ public class Function {
                         basicBlockBounds.Add(addr + 4);
                         branchPaths[addr] = new List<uint> { target };
                     }
+
                     // if the target is NOT a reg intrinsic, it's a tail call
-                    else if(!IsRegIntrinsic(target)){
+                    if(!IsRegIntrinsic(target)){
                         addr += 4; break;
                     }
                     else {
@@ -177,14 +181,19 @@ public class Function {
                     }
                 }
                 else if(mnemonic == "blr" || mnemonic == "blrl") {
-                    addr += 4;
-                    break; // (should we do this? i *think* in some switch cases there may be multiple blrs)
+                    // if there are no more established basic block bounds that are > this address, it IS a tail call
+                    uint? firstGreaterBound = basicBlockBounds.FirstOrDefault(x => x > addr);
+                    if (firstGreaterBound == 0) {
+                        addr += 4; break;
+                    }
+                    //addr += 4;
+                    //break; // (should we do this? i *think* in some switch cases there may be multiple blrs)
                 }
                 else throw new Exception($"Unhandled branch instruction {mnemonic}!");
             }
         }
 
-        addressEnd = addr;
+        if(!knownFromPData) addressEnd = addr;
         // construct the basic blocks
         for (int i = 0; i < basicBlockBounds.Count; i++) {
             BasicBlock block = new BasicBlock();
