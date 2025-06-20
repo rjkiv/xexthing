@@ -4,7 +4,7 @@ using System.Linq;
 using System.Text;
 using System.Threading.Tasks;
 
-class BEBinaryReader : BinaryReader {
+public class BEBinaryReader : BinaryReader {
     public BEBinaryReader(System.IO.Stream stream) : base(stream) { }
 
     public override ushort ReadUInt16() {

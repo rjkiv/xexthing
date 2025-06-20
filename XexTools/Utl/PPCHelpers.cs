@@ -36,6 +36,10 @@ public static class PPCHelper {
         return instr == 0x4e800020;
     }
 
+    public static bool IsBLRL(uint instr) {
+        return instr == 0x4e800021;
+    }
+
     public static bool IsLIS(uint instr) {
         if ((instr & 0xFC000000) != 0x3C000000) return false;
         return (instr & 0xFC1F0000) == 0x3C000000;
@@ -47,5 +51,10 @@ public static class PPCHelper {
 
     public static bool IsAddi(uint instr) {
         return (instr & 0xFC000000) == 0x38000000;
+    }
+
+    public static bool IsBdnz(uint instr) {
+        if ((instr & 0xFC000000) != 0x40000000) return false;
+        return (instr & 0xFFFF0000) == 0x42000000;
     }
 }

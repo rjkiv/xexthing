@@ -6,46 +6,10 @@ using System.Threading.Tasks;
 using System.Reflection.PortableExecutable;
 using System.Diagnostics;
 using System.IO;
+using Gee.External.Capstone;
+using System.Net.WebSockets;
 
 class XexPE {
-    public class Function {
-        public string name;
-        public bool analyzed;
-        public uint addressStart;
-        public uint addressEnd;
-        public bool hasExceptionHandler;
-
-        public Function(string name, bool analyzed, uint addressStart, uint addressEnd, bool hasExceptionHandler) {
-            this.name = name;
-            this.analyzed = analyzed;
-            this.addressStart = addressStart;
-            this.addressEnd = addressEnd;
-            this.hasExceptionHandler = hasExceptionHandler;
-        }
-
-        // note: addr should already be calculated (i.e. not a raw byte offset)
-        public bool CheckBounds(uint addr) {
-            return addr >= addressStart && addr < addressEnd;
-        }
-
-        public bool IsGPRIntrinsic() {
-            return name.Contains("__savegprlr") || name.Contains("__restgprlr");
-        }
-
-        public bool IsFPRIntrinsic() {
-            return name.Contains("__savefpr") || name.Contains("__restfpr");
-        }
-
-        public bool IsVMXIntrinsic() {
-            return name.Contains("__savevmx") || name.Contains("__restvmx");
-        }
-
-        public bool IsRegIntrinsic() {
-            return IsGPRIntrinsic() || IsFPRIntrinsic() || IsVMXIntrinsic();
-        }
-
-    }
-
     public void ImportExeFromXex(byte[] xexPEImage) {
         PEReader pr = new PEReader(new MemoryStream(xexPEImage));
         var headers = pr.PEHeaders;
@@ -95,27 +59,25 @@ class XexPE {
         exeBytes = peAdjusted.ToArray();
     }
 
-    private void AddFunction(Function func) {
-        // make sure a function with the start address isn't already in here
-        int index = functionBoundaries.BinarySearch(func, Comparer<Function>.Create((x, y) => x.addressStart.CompareTo(y.addressStart)));
-
-        if (index >= 0) return;
-        // if there's no such function, insert it according to the raw byte start address
-        // insert it in a sorted manner now so we don't have to keep re-sorting as we add batches of functions
-        index = ~index;
-        functionBoundaries.Insert(index, func);
+    private Function? GetFunctionFromBounds(uint addr) {
+        foreach (var f in functionBoundaries)
+            if (addr >= f.addressStart && addr < f.addressEnd)
+                return f;
+        return null;
     }
 
-    private Function GetFunctionFromBounds(uint addr) {
-        return functionBoundaries.Find(x => addr >= x.addressStart && addr < x.addressEnd);
+    private Function? GetFunctionFromStartAddr(uint addr) {
+        foreach (var f in functionBoundaries)
+            if (f.addressStart == addr)
+                return f;
+        return null;
     }
 
-    private Function GetFunctionFromStartAddr(uint addr) {
-        return functionBoundaries.Find(x => addr == x.addressStart);
-    }
-
-    private Function GetFunctionFromName(string name) {
-        return functionBoundaries.Find(x => x.name == name);
+    private Function? GetFunctionFromName(string name) {
+        foreach (var f in functionBoundaries)
+            if (f.name == name)
+                return f;
+        return null;
     }
 
     private SectionHeader CalcSectionFromRawByteOffset(uint offset) {
@@ -160,188 +122,19 @@ class XexPE {
         return CalcAddrFromRawByteOffset((uint)(pc + bd));
     }
 
-    private bool IsOffsetPartOfKnownFunc(uint offset) {
-        uint addr = CalcAddrFromRawByteOffset(offset);
-        foreach(var func in functionBoundaries) {
-            if(func.CheckBounds(addr)) return true;
-        }
-        return false;
-    }
-
-    private void FindSaveAndRestoreRegisterFuncs() {
-        // the asm corresponding to savegprlrs 14-17 and savefprs 14-17
-        // stands to reason that if we find these in sequence, 18-31 will be right behind
-        byte[] saveGPRasm = { 0xf9, 0xc1, 0xff, 0x68, 0xf9, 0xe1, 0xff, 0x70, 0xfa, 0x01, 0xff, 0x78, 0xfa, 0x21, 0xff, 0x80 };
-        byte[] saveFPRasm = { 0xd9, 0xcc, 0xff, 0x70, 0xd9, 0xec, 0xff, 0x78, 0xda, 0x0c, 0xff, 0x80, 0xda, 0x2c, 0xff, 0x88 };
-
-        int theSaveGPRIdx = -1;
-
-        SectionHeader section = peSections[textSectionIndex];
-
-        for(int i = section.VirtualAddress; i < (section.VirtualAddress + section.SizeOfRawData) - saveGPRasm.Length; i++) {
-            if (exeBytes.Skip(i).Take(saveGPRasm.Length).SequenceEqual(saveGPRasm)) {
-                theSaveGPRIdx = i;
-                break;
-            }
-        }
-
-        if(theSaveGPRIdx == -1) {
-            throw new Exception("Save gpr compiler intrinsics not found. Is that even possible for an xex?");
-        }
-
-        for(int i = 14; i <= 31; i++, theSaveGPRIdx += 4) {
-            Function saveFunc = new Function($"__savegprlr_{i}", true,
-                CalcAddrFromRawByteOffset((uint)theSaveGPRIdx), CalcAddrFromRawByteOffset((uint)theSaveGPRIdx + 4), true);
-            Function restoreFunc = new Function($"__restgprlr_{i}", true,
-                CalcAddrFromRawByteOffset((uint)theSaveGPRIdx + 0x50), CalcAddrFromRawByteOffset((uint)theSaveGPRIdx + 0x54), true);
-            AddFunction(saveFunc);
-            AddFunction(restoreFunc);
-        }
-
-        int theSaveFPRIdx = -1;
-
-        for (int i = section.VirtualAddress; i < (section.VirtualAddress + section.SizeOfRawData) - saveGPRasm.Length; i++) {
-            if (exeBytes.Skip(i).Take(saveGPRasm.Length).SequenceEqual(saveFPRasm)) {
-                theSaveFPRIdx = i;
-                break;
-            }
-        }
-
-        if (theSaveFPRIdx == -1) {
-            throw new Exception("Save fpr compiler intrinsics not found. Is that even possible for an xex?");
-        }
-
-        for (int i = 14; i <= 31; i++, theSaveFPRIdx += 4) {
-            Function saveFunc = new Function($"__savefpr_{i}", true, 
-                CalcAddrFromRawByteOffset((uint)theSaveFPRIdx), CalcAddrFromRawByteOffset((uint)theSaveFPRIdx + 4), true);
-            Function restoreFunc = new Function($"__restfpr_{i}", true, 
-                CalcAddrFromRawByteOffset((uint)theSaveFPRIdx + 0x4C), CalcAddrFromRawByteOffset((uint)theSaveFPRIdx + 0x50), true);
-            AddFunction(saveFunc);
-            AddFunction(restoreFunc);
-        }
-
-        // TODO: find and mark vmx save/restore funcs
-        // the asm corresponding to savevmx's 14-17
-        // stands to reason that if we find these in sequence, the others will be right behind
-        byte[] saveVMXasm = { 0x39, 0x60, 0xfe, 0xe0, 0x7d, 0xcb, 0x61, 0xce, 0x39, 0x60, 0xfe, 0xf0, 0x7d, 0xeb, 0x61, 0xce,
-                              0x39, 0x60, 0xff, 0x00, 0x7e, 0x0b, 0x61, 0xce, 0x39, 0x60, 0xff, 0x10, 0x7e, 0x2b, 0x61, 0xce};
-
-        int theSaveVMXIdx = -1;
-
-        for (int i = section.VirtualAddress; i < (section.VirtualAddress + section.SizeOfRawData) - saveVMXasm.Length; i++) {
-            if (exeBytes.Skip(i).Take(saveVMXasm.Length).SequenceEqual(saveVMXasm)) {
-                theSaveVMXIdx = i;
-                break;
-            }
-        }
-
-        if (theSaveVMXIdx == -1) {
-            throw new Exception("Save vmx compiler intrinsics not found. Is that even possible for an xex?");
-        }
-
-        // the order goes: save 14-31, then 64-127, with each func taking up 8 bytes
-        for(int i = 14; i <= 31; i++, theSaveVMXIdx += 8) {
-            //Console.WriteLine($"Found __savevmx_{i} at 0x{CalcAddrFromRawByteOffset((uint)theSaveVMXIdx):X}");
-            Function saveFunc = new Function($"__savevmx_{i}", true,
-                CalcAddrFromRawByteOffset((uint)theSaveVMXIdx), CalcAddrFromRawByteOffset((uint)theSaveVMXIdx + 8), true);
-            AddFunction(saveFunc);
-        }
-        theSaveVMXIdx += 4;
-        for (int i = 64; i <= 127; i++, theSaveVMXIdx += 8) {
-            //Console.WriteLine($"Found __savevmx_{i} at 0x{CalcAddrFromRawByteOffset((uint)theSaveVMXIdx):X}");
-            Function saveFunc = new Function($"__savevmx_{i}", true,
-                CalcAddrFromRawByteOffset((uint)theSaveVMXIdx), CalcAddrFromRawByteOffset((uint)theSaveVMXIdx + 8), true);
-            AddFunction(saveFunc);
-        }
-        theSaveVMXIdx += 4;
-        for (int i = 14; i <= 31; i++, theSaveVMXIdx += 8) {
-            //Console.WriteLine($"Found __restvmx_{i} at 0x{CalcAddrFromRawByteOffset((uint)theSaveVMXIdx):X}");
-            Function restoreFunc = new Function($"__restvmx_{i}", true,
-                CalcAddrFromRawByteOffset((uint)theSaveVMXIdx), CalcAddrFromRawByteOffset((uint)theSaveVMXIdx + 8), true);
-            AddFunction(restoreFunc);
-        }
-        theSaveVMXIdx += 4;
-        for (int i = 64; i <= 127; i++, theSaveVMXIdx += 8) {
-            //Console.WriteLine($"Found __restvmx_{i} at 0x{CalcAddrFromRawByteOffset((uint)theSaveVMXIdx):X}");
-            Function restoreFunc = new Function($"__restvmx_{i}", true,
-                CalcAddrFromRawByteOffset((uint)theSaveVMXIdx), CalcAddrFromRawByteOffset((uint)theSaveVMXIdx + 8), true);
-            AddFunction(restoreFunc);
-        }
-    }
+    //private bool IsOffsetPartOfKnownFunc(uint offset) {
+    //    uint addr = CalcAddrFromRawByteOffset(offset);
+    //    foreach(var func in functionBoundaries) {
+    //        if(func.CheckBounds(addr)) return true;
+    //    }
+    //    return false;
+    //}
 
     private bool AddrIsText(uint addr) {
         SectionHeader textSection = peSections[textSectionIndex];
         uint textBegin = (uint)textSection.VirtualAddress + imageBase;
         uint textEnd = textBegin + (uint)textSection.VirtualSize;
         return addr >= textBegin && addr < textEnd;
-    }
-
-    private bool CheckPureCall(BEBinaryReader br) {
-        // we've passed the mfspr at this point
-        var start = br.BaseStream.Position - 4;
-        // is the next inst stw r12, -0x8(r1)?
-        if (br.ReadUInt32() != 0x9181fff8) return false;
-        List<uint> instrsTilReturn = new List<uint>();
-        while (true) {
-            uint inst = br.ReadUInt32();
-            instrsTilReturn.Add(inst);
-            if (PPCHelper.IsBLR(inst)) break;
-        }
-        int mtsprIdx = -1;
-        for(int i = 0; i < instrsTilReturn.Count; i++) {
-            var inst = instrsTilReturn[i];
-            // search the instrs til return for mtspr CTR, rx
-            if ((inst & 0xFC0007FF) == 0x7C0003A6) {
-                mtsprIdx = i;
-                break;
-            }
-        }
-        if (mtsprIdx == -1) return false;
-        // we're checking the next 7 instructions
-        if (mtsprIdx + 7 >= instrsTilReturn.Count) return false;
-        // bctrl
-        if (instrsTilReturn[mtsprIdx + 1] != 0x4e800421) return false;
-        // li r3, 0x19
-        if (instrsTilReturn[mtsprIdx + 2] != 0x38600019) return false;
-        // bl to some target
-        if (!PPCHelper.IsBL(instrsTilReturn[mtsprIdx + 3])) return false;
-        // li r4, 0x1
-        if (instrsTilReturn[mtsprIdx + 4] != 0x38800001) return false;
-        // li r3, 0x0
-        if (instrsTilReturn[mtsprIdx + 5] != 0x38600000) return false;
-        // bl
-        if (!PPCHelper.IsBL(instrsTilReturn[mtsprIdx + 6])) return false;
-        // another bl
-        if (!PPCHelper.IsBL(instrsTilReturn[mtsprIdx + 7])) return false;
-        // if all of these were somehow met, we're most likely dealing with a purecall
-        return true;
-    }
-
-    private List<uint> SweepForKnownFuncStartAddrs() {
-        HashSet<uint> knownAddrs = new();
-        SectionHeader textSection = peSections[textSectionIndex];
-        uint textBegin = (uint)textSection.VirtualAddress + imageBase;
-        uint textEnd = textBegin + (uint)textSection.VirtualSize;
-
-        BEBinaryReader br = new BEBinaryReader(new MemoryStream(exeBytes));
-        br.BaseStream.Seek(textSection.PointerToRawData, SeekOrigin.Begin);
-
-        while(br.BaseStream.Position < textSection.PointerToRawData + textSection.SizeOfRawData) {
-            var curPos = br.BaseStream.Position;
-            uint curInst = br.ReadUInt32();
-            // if this is a bl, note down the branch target
-            if (PPCHelper.IsBL(curInst)) {
-                uint branchTarget = CalculateBranchTarget((uint)curPos, curInst);
-                if(branchTarget >= textBegin && branchTarget < textEnd && GetFunctionFromBounds(branchTarget) == null && knownAddrs.Add(branchTarget)) {
-                    //Console.WriteLine($"Added new func start (branch target): 0x{branchTarget:X}");
-                }
-            }
-            // no need to search for function prologues, since .pdata seems to have those covered!
-        }
-
-        List<uint> sortedAddrs = knownAddrs.ToList();
-        sortedAddrs.Sort();
-        return sortedAddrs;
     }
 
     private uint NextKnownStartAddr(uint addr) {
@@ -374,140 +167,139 @@ class XexPE {
         return nextKnownAddr;
     }
 
-    private uint FindFunctionEnd(BEBinaryReader br, uint startAddr, uint maxAddr) {
-        var worklist = new Queue<uint>();
-        var visited = new HashSet<uint>();
-        uint highestAddr = startAddr;
-        SectionHeader textSection = peSections[textSectionIndex];
-        uint textSectionBegin = (uint)textSection.VirtualAddress + imageBase;
-        uint textSectionEnd = textSectionBegin + (uint)textSection.SizeOfRawData;
-        var originalPos = br.BaseStream.Position; // the position in the BR corresponding to the start of the func
+    //private uint FindFunctionEnd(BEBinaryReader br, uint startAddr, uint maxAddr) {
+    //    var worklist = new Queue<uint>();
+    //    var visited = new HashSet<uint>();
+    //    uint highestAddr = startAddr;
+    //    SectionHeader textSection = peSections[textSectionIndex];
+    //    uint textSectionBegin = (uint)textSection.VirtualAddress + imageBase;
+    //    uint textSectionEnd = textSectionBegin + (uint)textSection.SizeOfRawData;
+    //    var originalPos = br.BaseStream.Position; // the position in the BR corresponding to the start of the func
 
-        worklist.Enqueue(startAddr);
+    //    worklist.Enqueue(startAddr);
 
-        while(worklist.Count > 0) {
-            uint addr = worklist.Dequeue();
+    //    while(worklist.Count > 0) {
+    //        uint addr = worklist.Dequeue();
 
-            if(visited.Contains(addr) || addr >= maxAddr || addr < textSectionBegin)
-                continue;
+    //        if(visited.Contains(addr) || addr >= maxAddr || addr < textSectionBegin)
+    //            continue;
 
-            visited.Add(addr);
-            if (addr > highestAddr)
-                highestAddr = addr;
+    //        visited.Add(addr);
+    //        if (addr > highestAddr)
+    //            highestAddr = addr;
 
-            int offset = textSection.PointerToRawData + (int)(addr - textSectionBegin);
-            if (offset + 4 > textSectionEnd) continue;
+    //        int offset = textSection.PointerToRawData + (int)(addr - textSectionBegin);
+    //        if (offset + 4 > textSectionEnd) continue;
 
-            br.BaseStream.Seek(offset, SeekOrigin.Begin);
-            uint instr = br.PeekUInt32();
+    //        br.BaseStream.Seek(offset, SeekOrigin.Begin);
+    //        uint instr = br.PeekUInt32();
 
-            // if we somehow managed to have a 0 slip through the cracks, stop, this is the end
-            if (instr == 0) {
-                highestAddr -= 4;
-                break;
-            }
+    //        // if we somehow managed to have a 0 slip through the cracks, stop, this is the end
+    //        if (instr == 0) {
+    //            highestAddr -= 4;
+    //            break;
+    //        }
 
-            // if blr
-            if (PPCHelper.IsBLR(instr)) continue;
+    //        // if blr
+    //        if (PPCHelper.IsBLR(instr)) continue;
 
-            // if unconditional branch (b or bl)
-            if(PPCHelper.IsBranch(instr) || PPCHelper.IsBL(instr)) {
-                uint target = CalculateBranchTarget((uint)offset, instr);
-                // if the target is within the bounds of (startAddr, maxAddr), add it to our analysis queue
-                if(target >= textSectionBegin && target > startAddr && target < maxAddr) {
-                    worklist.Enqueue(target);
-                }
-                else {
-                    // else, if this is a b, this *might* be a tail call
-                    // TODO: handle additional logic to determine if this b is a tail call or not
-                    if (PPCHelper.IsBranch(instr)) {
+    //        // if unconditional branch (b or bl)
+    //        if(PPCHelper.IsBranch(instr) || PPCHelper.IsBL(instr)) {
+    //            uint target = CalculateBranchTarget((uint)offset, instr);
+    //            // if the target is within the bounds of (startAddr, maxAddr), add it to our analysis queue
+    //            if(target >= textSectionBegin && target > startAddr && target < maxAddr) {
+    //                worklist.Enqueue(target);
+    //            }
+    //            else {
+    //                // else, if this is a b, this *might* be a tail call
+    //                // TODO: handle additional logic to determine if this b is a tail call or not
+    //                if (PPCHelper.IsBranch(instr)) {
 
-                        br.BaseStream.Seek(4, SeekOrigin.Current);
-                        uint nextInst = br.PeekUInt32();
-                        // if the next instruction over is all 0's, this is definitely a tail call
-                        if (nextInst == 0) {
-                            break;
-                        }
-                        // if the next instruction over's addr == maxAddr, tail call
-                        else if(addr + 4 == maxAddr) {
-                            break;
-                        }
-                        // if the next instruction over's addr < highestAddr + 4, it's NOT a tail call
-                        // use addr + 4 for this
-                        else if (addr + 4 < highestAddr + 4) {
-                            // NOT a tail call, don't do anything
-                        }
-                        // if addr + 4 == highestAddr + 4 AND highestAddr + 4 is in the workList, don't mark it as a tail call, because we don't know for sure
-                        // explorer that inst first instead of coming to a concrete conclusion
-                        else if((addr + 4 == highestAddr + 4) && worklist.Contains(addr + 4)) {
-                            // we don't know for sure, so don't do anything
-                        }
-                        // if the target is part of a known, non-reg intrinsic function, tail call
-                        else if(GetFunctionFromBounds(target) != null && !GetFunctionFromBounds(target).IsRegIntrinsic()) {
-                            break;
-                        }
-                        // if the target is NOT part of a known function
-                        else if (GetFunctionFromBounds(target) == null) {
-                            // if the b target is past the known start addr of this func, definitely a tail call
-                            if (target < startAddr) {
-                                break;
-                            }
-                            // if the b target is at or past the known start addr of a later func, definitely a tail call
-                            if (target >= maxAddr) {
-                                break;
-                            }
-                        }
-                        else {
-                            //Console.WriteLine($"Branch at 0x{addr:X} might be a tail call!");
-                        }
-                    }
-                }
+    //                    br.BaseStream.Seek(4, SeekOrigin.Current);
+    //                    uint nextInst = br.PeekUInt32();
+    //                    // if the next instruction over is all 0's, this is definitely a tail call
+    //                    if (nextInst == 0) {
+    //                        break;
+    //                    }
+    //                    // if the next instruction over's addr == maxAddr, tail call
+    //                    else if(addr + 4 == maxAddr) {
+    //                        break;
+    //                    }
+    //                    // if the next instruction over's addr < highestAddr + 4, it's NOT a tail call
+    //                    // use addr + 4 for this
+    //                    else if (addr + 4 < highestAddr + 4) {
+    //                        // NOT a tail call, don't do anything
+    //                    }
+    //                    // if addr + 4 == highestAddr + 4 AND highestAddr + 4 is in the workList, don't mark it as a tail call, because we don't know for sure
+    //                    // explorer that inst first instead of coming to a concrete conclusion
+    //                    else if((addr + 4 == highestAddr + 4) && worklist.Contains(addr + 4)) {
+    //                        // we don't know for sure, so don't do anything
+    //                    }
+    //                    // if the target is part of a known, non-reg intrinsic function, tail call
+    //                    else if(GetFunctionFromBounds(target) != null && !GetFunctionFromBounds(target).IsRegIntrinsic()) {
+    //                        break;
+    //                    }
+    //                    // if the target is NOT part of a known function
+    //                    else if (GetFunctionFromBounds(target) == null) {
+    //                        // if the b target is past the known start addr of this func, definitely a tail call
+    //                        if (target < startAddr) {
+    //                            break;
+    //                        }
+    //                        // if the b target is at or past the known start addr of a later func, definitely a tail call
+    //                        if (target >= maxAddr) {
+    //                            break;
+    //                        }
+    //                    }
+    //                    else {
+    //                        //Console.WriteLine($"Branch at 0x{addr:X} might be a tail call!");
+    //                    }
+    //                }
+    //            }
 
-                if (PPCHelper.IsBL(instr)) {
-                    worklist.Enqueue(addr + 4);
-                }
-                continue;
-            }
+    //            if (PPCHelper.IsBL(instr)) {
+    //                worklist.Enqueue(addr + 4);
+    //            }
+    //            continue;
+    //        }
 
-            // if conditional branch (bc or bcl)
-            // TODO: add extra logic to check for bgt's to jump tables
-            if(PPCHelper.IsConditionalBranch(instr)) {
-                uint target = CalculateConditionalBranchTarget((uint)offset, instr);
-                if (target >= textSectionBegin && target > startAddr && target < maxAddr)
-                    worklist.Enqueue(target);
+    //        // if conditional branch (bc or bcl)
+    //        // TODO: add extra logic to check for bgt's to jump tables
+    //        if(PPCHelper.IsConditionalBranch(instr)) {
+    //            uint target = CalculateConditionalBranchTarget((uint)offset, instr);
+    //            if (target >= textSectionBegin && target > startAddr && target < maxAddr)
+    //                worklist.Enqueue(target);
 
-                worklist.Enqueue(addr + 4); // fallthrough path
-                continue;
-            }
+    //            worklist.Enqueue(addr + 4); // fallthrough path
+    //            continue;
+    //        }
 
-            // this current inst ain't nothin special, just go ahead and add the next addr over
-            worklist.Enqueue(addr + 4);
-        }
+    //        // this current inst ain't nothin special, just go ahead and add the next addr over
+    //        worklist.Enqueue(addr + 4);
+    //    }
 
-        //Console.WriteLine($"Func that starts at 0x{startAddr:X}, ends at 0x{highestAddr + 4:X}");
-        // now that we know where the end is, move the reader ahead up to that point
-        br.BaseStream.Seek(originalPos + (highestAddr + 4 - startAddr), SeekOrigin.Begin);
-        return highestAddr + 4;
-    }
+    //    //Console.WriteLine($"Func that starts at 0x{startAddr:X}, ends at 0x{highestAddr + 4:X}");
+    //    // now that we know where the end is, move the reader ahead up to that point
+    //    br.BaseStream.Seek(originalPos + (highestAddr + 4 - startAddr), SeekOrigin.Begin);
+    //    return highestAddr + 4;
+    //}
 
     private void DumpFuncs() {
         string funcsDump = "";
         foreach (var func in functionBoundaries) {
             funcsDump += $"{func.name}: 0x{func.addressStart:X} - 0x{func.addressEnd:X}\n";
         }
-        File.WriteAllText("D:\\DC3 Debug\\Gamepad\\Debug\\jeff_funcs_cfa.txt", funcsDump);
+        File.WriteAllText("D:\\DC3 Debug\\Gamepad\\Debug\\jeff_funcs.txt", funcsDump);
     }
 
-    public void BrowsePData() {
-        if(pDataSectionIndex == -1) {
+    private void BrowsePData() {
+        if (pDataSectionIndex == -1)
             throw new Exception(".pdata section not found. Is that even possible for an xex?");
-        }
 
         SectionHeader pDataSection = peSections[pDataSectionIndex];
         BEBinaryReader br = new BEBinaryReader(new MemoryStream(exeBytes));
         br.BaseStream.Seek(pDataSection.PointerToRawData, SeekOrigin.Begin);
-        Console.WriteLine($".pdata begins at 0x{CalcAddrFromRawByteOffset((uint)pDataSection.PointerToRawData):X}");
-        while(br.BaseStream.Position < pDataSection.PointerToRawData + pDataSection.SizeOfRawData) {
+        //Console.WriteLine($".pdata begins at 0x{CalcAddrFromRawByteOffset((uint)pDataSection.PointerToRawData):X}");
+        while (br.BaseStream.Position < pDataSection.PointerToRawData + pDataSection.SizeOfRawData) {
             uint beginAddr = br.ReadUInt32();
             if (beginAddr == 0) break; // if we encounter 0's, that's the end of usable pdata entries
             uint theRest = br.ReadUInt32();
@@ -517,35 +309,58 @@ class XexPE {
             bool flag32Bit = (theRest & 0x4000) != 0;
             bool exceptionFlag = (theRest & 0x8000) != 0;
 
-            // if we encounter the save/restore reg intrinsics, we don't need to worry
-            // because AddFunction checks for duplicate start addresses and disregards them
-            AddFunction(new Function($"fn_{beginAddr:X}", false, beginAddr, beginAddr + (numInstsInFunc * 4), exceptionFlag));
-
-            //Console.WriteLine($"Func found: 0x{beginAddr:X} - 0x{beginAddr + (numInstsInFunc * 4):X}");
+            // using a sorted set to not worry about duplicates (like the reg intrinsics or XAPI calls)
+            if (functionBoundaries.Add(new Function(beginAddr, beginAddr + (numInstsInFunc * 4), exceptionFlag))) {
+                //Console.WriteLine($"Func found: 0x{beginAddr:X} - 0x{beginAddr + (numInstsInFunc * 4):X}");
+            }
         }
     }
 
-    public void FindFunctionBoundaries() {
-        // new iteration:
-        // sweep to find XAPI calls too! starting with XamInputGetCapabilities: e.g. 0x01000190020001907d6903a64e800420
+    private void CreateSpeculativeFunctions() {
+        HashSet<uint> knownAddrs = new();
+        SectionHeader textSection = peSections[textSectionIndex];
+        uint textBegin = (uint)textSection.VirtualAddress + imageBase;
+        uint textEnd = textBegin + (uint)textSection.VirtualSize;
 
-        // initial sweep to find and label the save/restore reg funcs
-        FindSaveAndRestoreRegisterFuncs();
-        // go through .pdata and add Function entries for each one you find
-        BrowsePData();
-        // do a sweep to find any still-unaccounted-for func start addresses
-        knownStartAddrs = SweepForKnownFuncStartAddrs();
+        var disasm = CapstoneDisassembler.CreatePowerPcDisassembler(Gee.External.Capstone.PowerPc.PowerPcDisassembleMode.BigEndian);
+        disasm.EnableInstructionDetails = true;
 
-        // and then search for func start addrs from vtables
-        // to find a vtable, search for r11 and a combo of lis, addi, and stw addr, 0x0(RX)
-        // go to that address, and mark every entry that is within the .text bounds
-        // TODO: if we have a map, add those start addresses too
+        BEBinaryReader br = new BEBinaryReader(new MemoryStream(exeBytes));
+        br.BaseStream.Seek(textSection.PointerToRawData, SeekOrigin.Begin);
+        // sweep the .text section for any bl's, so we can note their branch target
+        while (br.BaseStream.Position < textSection.PointerToRawData + textSection.SizeOfRawData) {
+            var curPos = br.BaseStream.Position; // because we want the position BEFORE the 4 bytes are read
+            uint curInst = br.ReadUInt32();
 
+            if (PPCHelper.IsBL(curInst)) {
+                byte[] instBytes = BitConverter.GetBytes(curInst);
+                Array.Reverse(instBytes);
+                var inst = disasm.Disassemble(instBytes, CalcAddrFromRawByteOffset((uint)curPos))[0];
+                Debug.Assert(inst.Mnemonic == "bl", "Not a bl instruction...somehow");
+                uint branchTarget = Convert.ToUInt32(inst.Operand, 16);
+                if (branchTarget >= textBegin && branchTarget < textEnd && GetFunctionFromBounds(branchTarget) == null && knownAddrs.Add(branchTarget)) {
+                    //Console.WriteLine($"Added new func start (branch target): 0x{branchTarget:X}");
+                }
+            }
+        }
+
+        // once we've completed our sweep, sort the branch targets in ascending order
+        List<uint> sortedAddrs = knownAddrs.ToList();
+        sortedAddrs.Sort();
+        knownStartAddrs = sortedAddrs;
+        // then, for each branch target, create a Function from bounds (branch target, next known start addr)
+        foreach (var addr in sortedAddrs) {
+            functionBoundaries.Add(new Function(addr, NextKnownStartAddr(addr)));
+        }
+        knownStartAddrs.Clear();
+    }
+
+    private void BreakFuncsDownIntoBlocks() {
         // perform CFA on any remaining necessary funcs
         BEBinaryReader br = new BEBinaryReader(new MemoryStream(exeBytes));
         SectionHeader textSection = peSections[textSectionIndex];
         br.BaseStream.Seek(textSection.PointerToRawData, SeekOrigin.Begin);
-        while(br.BaseStream.Position < textSection.PointerToRawData + textSection.SizeOfRawData) {
+        while (br.BaseStream.Position < textSection.PointerToRawData + textSection.SizeOfRawData) {
             // note current PC and virtual addr
             var curPos = br.BaseStream.Position;
             uint curAddr = CalcAddrFromRawByteOffset((uint)curPos);
@@ -555,28 +370,24 @@ class XexPE {
                 br.BaseStream.Seek(4, SeekOrigin.Current);
                 continue;
             }
-            // ignore the funcs we found earlier
-            else if (GetFunctionFromBounds(curAddr) != null) {
-                Function func = GetFunctionFromBounds(curAddr);
-                //Console.WriteLine($"Encountered {func.name} at {curAddr:X}, skipping forward to...0x{func.addressEnd:X}");
-                if(func.IsGPRIntrinsic()) {
-                    Function lastRestoreFunc = GetFunctionFromName("__restgprlr_31");
-                    br.BaseStream.Seek(lastRestoreFunc.addressEnd - curAddr, SeekOrigin.Current);
-                    continue;
+            // if this is an established func, refine its boundaries and create basic blocks
+            else {
+                Function? func = GetFunctionFromStartAddr(curAddr);
+                if (func != null) {
+                    func.FindBasicBlocks(br);
+                    //Console.WriteLine($"{func.name} from 0x{func.addressStart:X} - 0x{func.addressEnd:X}");
+                    br.BaseStream.Seek(curPos + (func.addressEnd - func.addressStart), SeekOrigin.Begin);
+                    // skip the br to this func's determined end
+                    // then, continue
                 }
-                else if(func.IsFPRIntrinsic()) {
-                    Function lastRestoreFunc = GetFunctionFromName("__restfpr_31");
-                    br.BaseStream.Seek(lastRestoreFunc.addressEnd - curAddr, SeekOrigin.Current);
-                    continue;
-                }
-                else if (func.IsVMXIntrinsic()) {
-                    Function lastRestoreFunc = GetFunctionFromName("__restvmx_127");
-                    br.BaseStream.Seek(lastRestoreFunc.addressEnd - curAddr, SeekOrigin.Current);
-                    continue;
-                }
+                // if we've reached this block, we have a possible start of a function we didn't find
                 else {
-                    br.BaseStream.Seek(func.addressEnd - curAddr, SeekOrigin.Current);
-                    continue;
+                    uint next = NextKnownStartAddr(curAddr);
+                    Function newFunc = new Function(curAddr, next);
+                    newFunc.FindBasicBlocks(br);
+                    functionBoundaries.Add(newFunc);
+                    //Console.WriteLine($"{newFunc.name} from 0x{newFunc.addressStart:X} - 0x{newFunc.addressEnd:X}");
+                    br.BaseStream.Seek(curPos + (newFunc.addressEnd - newFunc.addressStart), SeekOrigin.Begin);
                 }
             }
             //// ignore random branches to xidata (or should we be ignoring these?)
@@ -591,23 +402,111 @@ class XexPE {
             //        }
             //    }
             //}
-
-            uint nextKnownStartAddr = NextKnownStartAddr(curAddr);
-            //Console.WriteLine($"The func is from 0x{curAddr:X} til up to 0x{nextKnownStartAddr:X}");
-            uint funcEnd = FindFunctionEnd(br, curAddr, nextKnownStartAddr);
-            AddFunction(new Function($"fn_{curAddr:X}", true, curAddr, funcEnd, false));
         }
 
         Console.WriteLine($"Found {functionBoundaries.Count} functions");
+    }
+
+    public void Disassemble() {
+        Intrinsics.FindRegIntrinsics(exeBytes, peSections[textSectionIndex], imageBase, ref functionBoundaries);
+        Intrinsics.FindXCalls(exeBytes, peSections[textSectionIndex], imageBase, ref functionBoundaries);
+        BrowsePData();
+        // sweep for more start addresses using bl targets
+        CreateSpeculativeFunctions();
+        BreakFuncsDownIntoBlocks();
         DumpFuncs();
-        // need to resolve jump tables
+    }
+
+    public void FindFunctionBoundaries() {
+        //// new iteration:
+        //// initial sweep to find and label the save/restore reg funcs
+        //// sweep to find XAPI calls too! starting with XamInputGetCapabilities: e.g. 0x01000190020001907d6903a64e800420
+        //// go through .pdata, but for each Function you find, analyze it for .data, jump tables, and funcptrs to more .text starts: Analyze(Function), used for if you know the func bounds
+        //// rework the CFA func? to maybe Analyze(Function& func)? or Analyze(int funcIndex)? we're gonna need the start address, next known start address, and BEBinaryReader
+
+        //// after .pdata has completed iteration,
+        //// do a sweep to find any still-unaccounted-for func start addresses
+        //// this can be achieved with: branch targets, any vtables you found
+
+        //// initial sweep to find and label the save/restore reg funcs
+        //FindSaveAndRestoreRegisterFuncs();
+        //// go through .pdata and add Function entries for each one you find
+        //BrowsePData();
+        //// do a sweep to find any still-unaccounted-for func start addresses
+        //knownStartAddrs = SweepForKnownFuncStartAddrs();
+
+        //// and then search for func start addrs from vtables
+        //// to find a vtable, search for r11 and a combo of lis, addi, and stw addr, 0x0(RX)
+        //// go to that address, and mark every entry that is within the .text bounds
+        //// TODO: if we have a map, add those start addresses too
+
+        //// perform CFA on any remaining necessary funcs
+        //BEBinaryReader br = new BEBinaryReader(new MemoryStream(exeBytes));
+        //SectionHeader textSection = peSections[textSectionIndex];
+        //br.BaseStream.Seek(textSection.PointerToRawData, SeekOrigin.Begin);
+        //while(br.BaseStream.Position < textSection.PointerToRawData + textSection.SizeOfRawData) {
+        //    // note current PC and virtual addr
+        //    var curPos = br.BaseStream.Position;
+        //    uint curAddr = CalcAddrFromRawByteOffset((uint)curPos);
+
+        //    // ignore zero-padding
+        //    if (br.PeekUInt32() == 0) {
+        //        br.BaseStream.Seek(4, SeekOrigin.Current);
+        //        continue;
+        //    }
+        //    // ignore the funcs we found earlier
+        //    else if (GetFunctionFromBounds(curAddr) != null) {
+        //        Function func = GetFunctionFromBounds(curAddr);
+        //        //Console.WriteLine($"Encountered {func.name} at {curAddr:X}, skipping forward to...0x{func.addressEnd:X}");
+        //        if(func.IsGPRIntrinsic()) {
+        //            Function lastRestoreFunc = GetFunctionFromName("__restgprlr_31");
+        //            br.BaseStream.Seek(lastRestoreFunc.addressEnd - curAddr, SeekOrigin.Current);
+        //            continue;
+        //        }
+        //        else if(func.IsFPRIntrinsic()) {
+        //            Function lastRestoreFunc = GetFunctionFromName("__restfpr_31");
+        //            br.BaseStream.Seek(lastRestoreFunc.addressEnd - curAddr, SeekOrigin.Current);
+        //            continue;
+        //        }
+        //        else if (func.IsVMXIntrinsic()) {
+        //            Function lastRestoreFunc = GetFunctionFromName("__restvmx_127");
+        //            br.BaseStream.Seek(lastRestoreFunc.addressEnd - curAddr, SeekOrigin.Current);
+        //            continue;
+        //        }
+        //        else {
+        //            br.BaseStream.Seek(func.addressEnd - curAddr, SeekOrigin.Current);
+        //            continue;
+        //        }
+        //    }
+        //    //// ignore random branches to xidata (or should we be ignoring these?)
+        //    //else {
+        //    //    var maybeBranchPC = br.BaseStream.Position;
+        //    //    uint maybeBranchInstr = br.PeekUInt32();
+        //    //    if(PPCHelper.IsBranch(maybeBranchInstr)) {
+        //    //        uint target = CalculateBranchTarget((uint)maybeBranchPC, maybeBranchInstr);
+        //    //        if (!AddrIsText(target)) {
+        //    //            br.BaseStream.Seek(4, SeekOrigin.Current);
+        //    //            continue;
+        //    //        }
+        //    //    }
+        //    //}
+
+        //    uint nextKnownStartAddr = NextKnownStartAddr(curAddr);
+        //    //Console.WriteLine($"The func is from 0x{curAddr:X} til up to 0x{nextKnownStartAddr:X}");
+        //    uint funcEnd = FindFunctionEnd(br, curAddr, nextKnownStartAddr);
+        //    AddFunction(new Function($"fn_{curAddr:X}", true, curAddr, funcEnd, false));
+        //}
+
+        //Console.WriteLine($"Found {functionBoundaries.Count} functions");
+        //DumpFuncs();
+        //// need to resolve jump tables
     }
 
     // debug only: just to check that at the very minimum, we found the function boundaries that the map knows of
     public void VerifyAgainstMap(XexMap xexMap) {
         foreach(var entry in xexMap.entries) {
             if (AddrIsText(entry.vaddr)) {
-                Function func = GetFunctionFromStartAddr(entry.vaddr);
+                Function? func = GetFunctionFromStartAddr(entry.vaddr);
                 if(func != null) {
                     // all good!
                 }
@@ -625,5 +524,7 @@ class XexPE {
     public int textSectionIndex;
     public List<uint> knownStartAddrs = new();
     public List<SectionHeader> peSections = new();
-    public List<Function> functionBoundaries = new();
+    // no two functions can have the same starting address
+    // sorted by starting address implicitly, we don't have to do the sorting ourselves
+    public SortedSet<Function> functionBoundaries = new SortedSet<Function>(new StartAddrCmp());
 }

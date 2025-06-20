@@ -28,7 +28,43 @@ class Program {
         Console.WriteLine("Map: " + mapFile);
         byte[] fileData = File.ReadAllBytes(xexFile);
 
-        //PEReader pr = new PEReader(new MemoryStream(File.ReadAllBytes(groundTruth)));
+        // don't mind all this, just screwing around to try and figure out how xex relocs are structured
+        //byte[] groundTruthBytes = File.ReadAllBytes(exeFile);
+        //PEReader pr = new PEReader(new MemoryStream(groundTruthBytes));
+        //BEBinaryReader groundTruthBR = new BEBinaryReader(new MemoryStream(groundTruthBytes));
+        //for(int i = 0; i < pr.PEHeaders.SectionHeaders.Length; i++) {
+        //    SectionHeader cur = pr.PEHeaders.SectionHeaders[i];
+        //    if(cur.Name == ".reloc") {
+        //        Console.WriteLine("Found relocs");
+        //        groundTruthBR.BaseStream.Seek(cur.PointerToRawData, SeekOrigin.Begin); // 0x006ec600
+        //        uint pageRVA = groundTruthBR.ReadUInt32();
+        //        uint blockSize = groundTruthBR.ReadUInt32();
+        //        uint entry1 = groundTruthBR.ReadUInt32();
+        //        uint entry2 = groundTruthBR.ReadUInt32();
+        //        uint entry3 = groundTruthBR.ReadUInt32();
+        //        uint entry4 = groundTruthBR.ReadUInt32();
+        //        uint entry5 = groundTruthBR.ReadUInt32();
+        //        uint entry6 = groundTruthBR.ReadUInt32();
+        //        uint entry7 = groundTruthBR.ReadUInt32();
+        //        uint entry8 = groundTruthBR.ReadUInt32();
+        //        uint entry9 = groundTruthBR.ReadUInt32();
+        //        uint entry10 = groundTruthBR.ReadUInt32();
+        //        uint entry11 = groundTruthBR.ReadUInt32();
+        //        uint entry12 = groundTruthBR.ReadUInt32();
+        //        uint entry13 = groundTruthBR.ReadUInt32();
+        //        uint entry14 = groundTruthBR.ReadUInt32();
+        //        uint entry15 = groundTruthBR.ReadUInt32();
+        //        uint entry16 = groundTruthBR.ReadUInt32();
+        //        uint entry17 = groundTruthBR.ReadUInt32();
+        //        uint entry18 = groundTruthBR.ReadUInt32();
+        //        uint entry19 = groundTruthBR.ReadUInt32();
+        //        uint entry20 = groundTruthBR.ReadUInt32();
+        //    }
+        //}
+
+        // TODO: look at the ground truth's relocs and see how they're formatted
+
+
         //var textSection = pr.GetSectionData(".text");
         //Console.WriteLine(textSection);
         //var reader = textSection.GetReader();
@@ -45,7 +81,10 @@ class Program {
         xexPE.ImportExeFromXex(xex.xexHeader.peImage);
 
         // 3. Control Flow Analysis
-        xexPE.FindFunctionBoundaries();
+        //xexPE.FindFunctionBoundaries();
+
+        xexPE.Disassemble();
+
         xexPE.VerifyAgainstMap(xexMap);
 
         //// Print Machine type
