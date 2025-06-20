@@ -140,10 +140,16 @@ class XexPE {
         return nextKnownAddr;
     }
 
-    private void DumpFuncs() {
+    private void DumpFuncs(bool includePdata) {
         string funcsDump = "";
         foreach (var func in functionBoundaries) {
-            funcsDump += $"{func.name}: 0x{func.addressStart:X} - 0x{func.addressEnd:X}\n";
+            if (func.knownFromPData) {
+                if (!includePdata) continue;
+                funcsDump += $"{func.name}: 0x{func.addressStart:X} - 0x{func.addressEnd:X} (pdata)\n";
+            }
+            else {
+                funcsDump += $"{func.name}: 0x{func.addressStart:X} - 0x{func.addressEnd:X}\n";
+            }
         }
         File.WriteAllText("D:\\DC3 Debug\\Gamepad\\Debug\\jeff_funcs.txt", funcsDump);
     }
@@ -271,7 +277,7 @@ class XexPE {
         // sweep for more start addresses using bl targets
         CreateSpeculativeFunctions();
         BreakFuncsDownIntoBlocks();
-        DumpFuncs();
+        DumpFuncs(false);
         VerifyAgainstPData();
     }
 

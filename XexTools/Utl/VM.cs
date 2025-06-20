@@ -197,7 +197,11 @@ public class Function {
             }
         }
 
-        if(!knownFromPData) addressEnd = addr;
+        if (knownFromPData && addressEnd != addr) {
+            basicBlockBounds.Add(addr);
+            Console.WriteLine($"WARNING: Tried to change known pdata end 0x{addressEnd:X} to 0x{addr:X}!");
+        }
+        if (!knownFromPData) addressEnd = addr;
         // construct the basic blocks
         for (int i = 0; i < basicBlockBounds.Count; i++) {
             BasicBlock block = new BasicBlock();
