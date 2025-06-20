@@ -57,4 +57,12 @@ public static class PPCHelper {
         if ((instr & 0xFC000000) != 0x40000000) return false;
         return (instr & 0xFFFF0000) == 0x42000000;
     }
+
+    public static bool IsLoadIndexed(uint instr) {
+        uint mask = instr & 0xfc0007ff;
+        if (mask == 0x7C0000AE) return true; // lbzx
+        if (mask == 0x7C00022E) return true; // lhzx
+        if (mask == 0x7C00002E) return true; // lwzx
+        return false;
+    }
 }

@@ -41,6 +41,8 @@ public static class Intrinsics {
             uint restoreAddr = saveAddr + 0x50;
             funcs.Add(new Function(saveAddr, saveAddr + 4, true, $"__savegprlr_{i}"));
             funcs.Add(new Function(restoreAddr, restoreAddr + 4, true, $"__restgprlr_{i}"));
+            if (i == 14) Function.gprStart = saveAddr;
+            if (i == 31) Function.gprEnd = restoreAddr + 4;
         }
 
         saveIdx = searchableBytes.IndexOf(Convert.FromHexString(regIntrinsics[1].bytes));
@@ -51,6 +53,8 @@ public static class Intrinsics {
             uint restoreAddr = saveAddr + 0x4C;
             funcs.Add(new Function(saveAddr, saveAddr + 4, true, $"__savefpr_{i}"));
             funcs.Add(new Function(restoreAddr, restoreAddr + 4, true, $"__restfpr_{i}"));
+            if (i == 14) Function.fprStart = saveAddr;
+            if (i == 31) Function.fprEnd = restoreAddr + 4;
         }
 
         saveIdx = searchableBytes.IndexOf(Convert.FromHexString(regIntrinsics[2].bytes));
@@ -61,6 +65,7 @@ public static class Intrinsics {
         for (int i = 14; i <= 31; i++, saveIdx += 8) {
             uint saveAddr = (uint)saveIdx - (uint)sectionToSearch.PointerToRawData + imageBase + (uint)sectionToSearch.VirtualAddress;
             funcs.Add(new Function(saveAddr, saveAddr + 8, true, $"__savevmx_{i}"));
+            if(i == 14) Function.vmxStart = saveAddr;
         }
         saveIdx += 4;
         for(int i = 64; i <= 127; i++, saveIdx += 8) {
@@ -76,6 +81,7 @@ public static class Intrinsics {
         for (int i = 64; i <= 127; i++, saveIdx += 8) {
             uint restoreAddr = (uint)saveIdx - (uint)sectionToSearch.PointerToRawData + imageBase + (uint)sectionToSearch.VirtualAddress;
             funcs.Add(new Function(restoreAddr, restoreAddr + 8, true, $"__restvmx_{i}"));
+            if (i == 127) Function.vmxEnd = restoreAddr + 8;
         }
     }
 

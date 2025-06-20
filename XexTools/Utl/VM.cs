@@ -33,14 +33,30 @@ public class Function {
     // the exception flag in .pdata. if this func is not in .pdata, this should be false
     public bool hasExceptionHandler;
 
+    public bool possibleJumpTable;
+
     //List<BasicBlock> basicBlocks = new List<BasicBlock> ();
     SortedSet<BasicBlock> basicBlocks = new SortedSet<BasicBlock>(new BlockStartCmp());
+
+    public static uint gprStart;
+    public static uint gprEnd;
+    public static uint fprStart;
+    public static uint fprEnd;
+    public static uint vmxStart;
+    public static uint vmxEnd;
+    public static bool IsRegIntrinsic(uint addr) {
+        if (addr >= gprStart && addr < gprEnd) return true;
+        if(addr >= fprStart && addr < fprEnd) return true;
+        if(addr >= vmxStart && addr < vmxEnd) return true;
+        return false;
+    }
 
     // start addr, end addr (either known or speculated max addr)
     public Function(uint start, uint end, string name = "") {
         addressStart = start;
         addressEnd = end;
         hasExceptionHandler = false;
+        possibleJumpTable = false;
         if (name == "") this.name = $"fn_{addressStart:X}";
         else this.name = name;
     }
@@ -50,6 +66,7 @@ public class Function {
         addressStart = start;
         addressEnd = end;
         hasExceptionHandler = hasHandler;
+        possibleJumpTable = false;
         if (name == "") this.name = $"fn_{addressStart:X}";
         else this.name = name;
     }
@@ -57,205 +74,140 @@ public class Function {
     public void SetName(string name) { this.name = name; }
     public void FindBasicBlocks(BEBinaryReader br) {
         var visited = new HashSet<uint>();
-        //var basicBlockBounds = new SortedSet<uint>();
+        var basicBlockBounds = new SortedSet<uint>();
         var startPos = br.BaseStream.Position;
         var endPos = startPos + (addressEnd - addressStart);
         var queue = new Queue<uint>();
         queue.Enqueue(addressStart);
-        //basicBlockBounds.Add(addressStart);
+        basicBlockBounds.Add(addressStart);
+        var branchPaths = new Dictionary<uint, List<uint>>();
 
         var disasm = CapstoneDisassembler.CreatePowerPcDisassembler(Gee.External.Capstone.PowerPc.PowerPcDisassembleMode.BigEndian);
         disasm.EnableInstructionDetails = true;
 
-        while (queue.Count > 0) {
-            uint addr = queue.Dequeue();
-            if(visited.Contains(addr)) continue;
+        // just go through every instruction one by one, marking block boundaries
+        // once you've got them, assemble them and mark down successors
 
-            visited.Add(addr);
-            var curBlock = new BasicBlock();
-            curBlock.startAddr = addr;
+        uint possibleJumpTableMask = 0;
 
-            uint curAddr = addr;
-            while(curAddr < addressEnd) {
-                uint curOffset = curAddr - addressStart;
-                if (curOffset + 4 > endPos) break;
+        uint addr = addressStart;
+        for(; addr < addressEnd; addr += 4) {
+            uint instr = br.ReadUInt32();
+            if (instr == 0) break; // ignore zero-padding
 
-                br.BaseStream.Seek(startPos + curOffset, SeekOrigin.Begin);
-                uint instr = br.PeekUInt32();
+            // if cmplwi, this is possibly the first of a sequence of jump table bytes
+            if ((instr & 0xFC000000) == 0x28000000) possibleJumpTableMask |= 1;
+            // if l(whatever)zx
+            if (PPCHelper.IsLoadIndexed(instr)  ) possibleJumpTableMask |= 4;
+            // if mtspr
+            if ((instr & 0xfc0007ff) == 0x7C0003a6 && possibleJumpTableMask == 7) possibleJumpTableMask |= 8;
 
-                // blr(l) = block ends here, no successors
-                if (PPCHelper.IsBLR(instr) || PPCHelper.IsBLRL(instr)) {
-                    curBlock.endAddr = curAddr + 4;
-                    basicBlocks.Add(curBlock);
-                    break;
+            // if inst & 0xF0000000 == 0x40000000, possible branch
+            if ((instr & 0xF0000000) == 0x40000000) {
+                byte[] instBytes = BitConverter.GetBytes(instr);
+                Array.Reverse(instBytes);
+                var bInst = disasm.Disassemble(instBytes, addr)[0];
+                char[] remove = ['+', '-']; // we don't care about speculative branch direction
+                string mnemonic = bInst.Mnemonic.TrimEnd(remove);
+                if(mnemonic == "bdnz" || mnemonic == "bdz" ||
+                    mnemonic == "bdzf" || mnemonic == "bdnzf" ||
+                    mnemonic == "bge" || mnemonic == "bgt" ||
+                    mnemonic == "bne" || mnemonic == "beq" ||
+                    mnemonic == "ble" || mnemonic == "blt") {
+                    if (mnemonic == "bgt" && (possibleJumpTableMask & 1) == 1) possibleJumpTableMask |= 2;
+                    // new bounds: the target, and the fallthrough
+                    uint target = (uint)bInst.Details.Operands[bInst.Details.Operands.Length - 1].Immediate;
+                    basicBlockBounds.Add(target);
+                    basicBlockBounds.Add(addr + 4);
+                    branchPaths[addr] = new List<uint> { target, addr + 4 };
                 }
-                // bl = block ends here, successor = the next addr over
-                else if (PPCHelper.IsBL(instr)) {
-                    curBlock.endAddr = curAddr + 4;
-                    curBlock.successors.Add(curBlock.endAddr);
-                    basicBlocks.Add(curBlock);
-                    queue.Enqueue(curAddr + 4);
-                    break;
+                else if(mnemonic == "bl" || mnemonic == "bctrl") {
+                    // we only want the fallthrough
+                    basicBlockBounds.Add(addr + 4);
                 }
-                // for a conditional branch, depending on if the branchTarget goes up or down, do different things
-                else if (PPCHelper.IsConditionalBranch(instr)) {
-                    byte[] instBytes = BitConverter.GetBytes(instr);
-                    Array.Reverse(instBytes);
-                    var inst = disasm.Disassemble(instBytes, curAddr)[0];
-                    uint branchTarget = (uint)inst.Details.Operands[inst.Details.Operands.Length - 1].Immediate;
-                    // goes down
-                    if (branchTarget > curAddr) {
-                        curBlock.endAddr = curAddr + 4;
-                        curBlock.successors.Add(branchTarget);
-                        curBlock.successors.Add(curBlock.endAddr);
-                        basicBlocks.Add(curBlock);
-                        queue.Enqueue(branchTarget);
-                        queue.Enqueue(curAddr + 4);
-                        break;
+                else if(mnemonic == "blelr" || mnemonic == "beqlr" || mnemonic == "bltlr" || mnemonic == "bnelr" || mnemonic == "bgelr" || mnemonic == "bdzlr" || mnemonic == "bgtlr") {
+                    basicBlockBounds.Add(addr + 4);
+                }
+                else if(mnemonic == "bctr") {
+                    if(possibleJumpTableMask == 15) {
+                        possibleJumpTableMask = 0;
+                        possibleJumpTable = true;
+                        basicBlockBounds.Add(addr + 4);
                     }
-                    // goes up
+                    // if not a possible jump table, this is the end
+                    // if there are no more established basic block bounds that are > this address, it IS a tail call
                     else {
-                        BasicBlock? prevBlock = basicBlocks.FirstOrDefault(b => b.startAddr < branchTarget && branchTarget <= b.endAddr);
-                        // if the target is part of a different, pre-established block
-                        if (prevBlock != null) {
-                            // if our branch target in the middle of said block
-                            if (prevBlock.endAddr != branchTarget) {
-                                // prevBlock's end address should now be this branch target
-                                prevBlock.endAddr = branchTarget;
-                                // the sole successor should now be the branch target
-                                prevBlock.successors.Clear();
-                                prevBlock.successors.Add(prevBlock.endAddr);
-                            }
-                            // otherwise, no need to do any splitting
-
-                            // this block should end just after the branch inst
-                            curBlock.endAddr = curAddr + 4;
-                            // add two successors: the branch target, and the fallthrough
-                            curBlock.successors.Add(branchTarget);
-                            curBlock.successors.Add(curAddr + 4);
-                            basicBlocks.Add(curBlock);
-                            // enqueue our successors
-                            queue.Enqueue(branchTarget);
-                            queue.Enqueue(curAddr + 4);
+                        uint? firstGreaterBound = basicBlockBounds.FirstOrDefault(x => x > addr);
+                        if(firstGreaterBound == 0) {
+                            addr += 4;
+                            if (PPCHelper.IsBLR(br.PeekUInt32())) addr += 4; // evil hack to make it end after the blr if the next inst is a blr
                             break;
                         }
-                        // if the target is part of this specific block...
-                        // if we're looping back to ourselves
-                        else if (branchTarget == curBlock.startAddr) {
-                            curBlock.endAddr = curAddr + 4;
-                            curBlock.successors.Add(curBlock.startAddr); // should we do this? i mean technically it's true
-                            curBlock.successors.Add(curAddr + 4);
-                            basicBlocks.Add(curBlock);
-                            queue.Enqueue(curAddr + 4);
-                            break;
+                    }
+                }
+                else if(mnemonic == "bnectr") {
+                    // anything special to do here?
+                }
+                else if(mnemonic == "b") {
+                    if(br.PeekUInt32() == 0) { // if the next inst is 0
+                        continue; // because the next iteration of the loop will catch that 0 and mark the end of this function
+                    }
+
+                    uint target = (uint)bInst.Details.Operands[bInst.Details.Operands.Length - 1].Immediate;
+                    // if the target is within the bounds of this function, add it to our bounds
+                    if (target >= addressStart && target < addressEnd) {
+                        basicBlockBounds.Add(target);
+                        // although not a fallthrough, this does mark the start of a new block
+                        basicBlockBounds.Add(addr + 4);
+                        branchPaths[addr] = new List<uint> { target };
+                    }
+                    // if the target is NOT a reg intrinsic, it's a tail call
+                    else if(!IsRegIntrinsic(target)){
+                        addr += 4; break;
+                    }
+                    else {
+                        // if there are no more established basic block bounds that are > this address, it IS a tail call
+                        uint? firstGreaterBound = basicBlockBounds.FirstOrDefault(x => x > addr);
+                        if (firstGreaterBound == 0) {
+                            addr += 4; break;
                         }
                         else {
-                            // cut this block off at the branch target, make it a successor, and then enqueue it
-                            curBlock.endAddr = branchTarget;
-                            curBlock.successors.Add(branchTarget);
-                            basicBlocks.Add(curBlock);
-                            queue.Enqueue(branchTarget);
-                            break;
+                            // any other logic to determine tail calls goes here
                         }
                     }
                 }
-                // TODO: else if is bc/bctr/bctrl starts with bc
-                else if (PPCHelper.IsBranch(instr)) {
-                    byte[] instBytes = BitConverter.GetBytes(instr);
-                    Array.Reverse(instBytes);
-                    var inst = disasm.Disassemble(instBytes, curAddr)[0];
-                    uint branchTarget = (uint)inst.Details.Operands[inst.Details.Operands.Length - 1].Immediate;
-                    // TODO: logic for handling tail calls
-                    // if the branch target isn't even part of the function
-                    // AND TODO: target is not a reg intrinsic!
-                    if (branchTarget < addressStart || branchTarget >= addressEnd) {
-                        // tail call, end it here
-                        curBlock.endAddr = curAddr;
-                        basicBlocks.Add(curBlock);
-                        break;
-                    }
-
-                    // if the branch goes down into the function
-                    if (branchTarget > curAddr) {
-                        curBlock.endAddr = curAddr + 4;
-                        curBlock.successors.Add(branchTarget);
-                        basicBlocks.Add(curBlock);
-                        queue.Enqueue(branchTarget);
-                        break;
-
-                    }
-                    // if the branch goes up into the function
-                    else {
-                        BasicBlock? prevBlock = basicBlocks.FirstOrDefault(b => b.startAddr < branchTarget && branchTarget <= b.endAddr);
-                        // if the target is part of a different, pre-established block
-                        if (prevBlock != null) {
-                            // if our branch target is in the middle of said block
-                            if (prevBlock.endAddr != branchTarget) {
-                                // prevBlock's end address should now be this branch target
-                                prevBlock.endAddr = branchTarget;
-                                // the sole successor should now be the branch target
-                                prevBlock.successors.Clear();
-                                prevBlock.successors.Add(prevBlock.endAddr);
-                            }
-                            // this block should end at the branch inst
-                            curBlock.endAddr = curAddr + 4;
-                            curBlock.successors.Add(branchTarget);
-                            basicBlocks.Add(curBlock);
-                            queue.Enqueue(branchTarget);
-                            break;
-                        }
-                        // if the target is part of this specific block...
-                        // if we're looping back to ourselves
-                        else if (branchTarget == curBlock.startAddr) {
-                            // would this even happen in the case of an unconditional branch?
-                            curBlock.endAddr = curAddr + 4;
-                            curBlock.successors.Add(curBlock.startAddr); // should we do this? i mean technically it's true
-                            curBlock.successors.Add(curAddr + 4);
-                            basicBlocks.Add(curBlock);
-                            queue.Enqueue(curAddr + 4);
-                            break;
-                        }
-                        else {
-                            // cut this block off at the branch target, make it a successor, and then enqueue it
-                            curBlock.endAddr = branchTarget;
-                            curBlock.successors.Add(branchTarget);
-                            basicBlocks.Add(curBlock);
-                            queue.Enqueue(branchTarget);
-                            break;
-                        }
-                    }
+                else if(mnemonic == "blr" || mnemonic == "blrl") {
+                    addr += 4;
+                    break; // (should we do this? i *think* in some switch cases there may be multiple blrs)
                 }
-                // if we've bumped into an existing BasicBlock
-                else if (basicBlocks.FirstOrDefault(b => b.startAddr == curAddr) != null) {
-                    curBlock.endAddr = curAddr;
-                    curBlock.successors.Add(curAddr);
-                    basicBlocks.Add(curBlock);
-                    queue.Enqueue(curAddr);
-                    break;
-                }
-                else curAddr += 4;
+                else throw new Exception($"Unhandled branch instruction {mnemonic}!");
             }
         }
+
+        addressEnd = addr;
+        // construct the basic blocks
+        for (int i = 0; i < basicBlockBounds.Count; i++) {
+            BasicBlock block = new BasicBlock();
+            block.startAddr = basicBlockBounds.ElementAt(i);
+            if (i == basicBlockBounds.Count - 1) block.endAddr = addressEnd;
+            else {
+                block.endAddr = basicBlockBounds.ElementAt(i + 1);
+                if (branchPaths.TryGetValue(block.endAddr - 4, out var branchResults)) {
+                    block.successors = branchResults;
+                }
+                // if there are no successors at this point, it means the block doesn't end in a branch instruction
+                // so, we'll add one successor that starts at the block's end address
+                if (block.successors.Count == 0) {
+                    block.successors.Add(block.endAddr);
+                }
+            }
+            basicBlocks.Add(block);
+        }
+
     }
     void Analyze() {
 
     }
-
-    //    public bool IsGPRIntrinsic() {
-    //        return name.Contains("__savegprlr") || name.Contains("__restgprlr");
-    //    }
-
-    //    public bool IsFPRIntrinsic() {
-    //        return name.Contains("__savefpr") || name.Contains("__restfpr");
-    //    }
-
-    //    public bool IsVMXIntrinsic() {
-    //        return name.Contains("__savevmx") || name.Contains("__restvmx");
-    //    }
-
-    //    public bool IsRegIntrinsic() {
-    //        return IsGPRIntrinsic() || IsFPRIntrinsic() || IsVMXIntrinsic();
-    //    }
 }
 
 class BlockStartCmp : IComparer<BasicBlock> {
@@ -269,208 +221,3 @@ class StartAddrCmp : IComparer<Function> {
         return x.addressStart.CompareTo(y.addressStart);
     }
 }
-
-/*
-
-class VM {
-    public uint GPR[32];
-};
-
-class VMState {
-    VM vm;
-    uint address;
-};
-
-class Instruction {
-    Opcode opcode;
-    // other stuff
-};
-
-class Function {
-    // the fn's name
-    public string name;
-    // the known start addr of this func
-    public uint addressStart;
-    // the end addr of this func (either found through .pdata or determined through FindBasicBlocks())
-    public uint addressEnd;
-    // the exception flag in .pdata. if this func is not in .pdata, this should be false
-    public bool hasExceptionHandler;
-
-    List<BasicBlock> basicBlocks;
-
-    // start addr, end addr (either known or speculated max addr)
-    Function(start addr, end addr, name = "")
-
-    // for if you find a function from .pdata
-    Function(start addr, end addr, hasExceptionHandler, name = "")
-
-    void SetName(string name);
-    void FindBasicBlocks();
-    void Analyze();
-};
- 
-
-void Analyze(Function func){
-    // the memory addresses to process
-    var worklist = new Stack<uint>();
-    // the memory addresses that we've visited, via CFA
-    var visited = new HashSet<uint>();
-
-    uint highestAddr = func.addressStart;
-    uint textSectionBegin = (uint)textSection.VirtualAddress + imageBase;
-    uint textSectionEnd = textSectionBegin + (uint)textSection.SizeOfRawData;
-    BEBinaryReader br = stream for the raw exeBytes
-
-    // our VM, initialized before function analysis begins
-    // contains 32 GPRs
-    VM curVM;
-
-    // a vector of VMStates, to be populated in the event we encounter a branch
-    Array<VMState> vmStates;
-
-    worklist.Push(func.addressStart);
-
-    while(worklist.Count > 0){
-        // the current address we're analyzing
-        uint addr = worklist.Pop();
-
-        if(visited.Contains(addr) || addr >= func.addressEnd || addr < textSectionBegin) continue;
-        visited.Add(addr);
-        if(addr > highestAddr) highestAddr = addr;
-
-        int offset = textSection.PointerToRawData + (int)(addr - textSectionBegin);
-        if (offset + 4 > textSectionEnd) continue;
-
-        br.BaseStream.Seek(offset, SeekOrigin.Begin);
-        uint instr = br.PeekUInt32();
-
-        // if the instruction is a non-branching arithmetic function, update the corresponding regs in curVM
-
-        // if we somehow managed to have a 0 slip through the cracks, stop, this is the end
-        if (instr == 0) { highestAddr -= 4; break; }
-
-        // if blr
-        if (PPCHelper.IsBLR(instr)) continue;
-    }
-    
-
-       var worklist = new Queue<uint>();
-        var visited = new HashSet<uint>();
-        uint highestAddr = startAddr;
-        SectionHeader textSection = peSections[textSectionIndex];
-        uint textSectionBegin = (uint)textSection.VirtualAddress + imageBase;
-        uint textSectionEnd = textSectionBegin + (uint)textSection.SizeOfRawData;
-        var originalPos = br.BaseStream.Position; // the position in the BR corresponding to the start of the func
-
-        worklist.Enqueue(startAddr);
-
-        while(worklist.Count > 0) {
-            uint addr = worklist.Dequeue();
-
-            if(visited.Contains(addr) || addr >= maxAddr || addr < textSectionBegin)
-                continue;
-
-            visited.Add(addr);
-            if (addr > highestAddr)
-                highestAddr = addr;
-
-            int offset = textSection.PointerToRawData + (int)(addr - textSectionBegin);
-            if (offset + 4 > textSectionEnd) continue;
-
-            br.BaseStream.Seek(offset, SeekOrigin.Begin);
-            uint instr = br.PeekUInt32();
-
-            // if we somehow managed to have a 0 slip through the cracks, stop, this is the end
-            if (instr == 0) {
-                highestAddr -= 4;
-                break;
-            }
-
-            // if blr
-            if (PPCHelper.IsBLR(instr)) continue;
-
-            // if unconditional branch (b or bl)
-            if(PPCHelper.IsBranch(instr) || PPCHelper.IsBL(instr)) {
-                uint target = CalculateBranchTarget((uint)offset, instr);
-                // if the target is within the bounds of (startAddr, maxAddr), add it to our analysis queue
-                if(target >= textSectionBegin && target > startAddr && target < maxAddr) {
-                    worklist.Enqueue(target);
-                }
-                else {
-                    // else, if this is a b, this *might* be a tail call
-                    // TODO: handle additional logic to determine if this b is a tail call or not
-                    if (PPCHelper.IsBranch(instr)) {
-
-                        br.BaseStream.Seek(4, SeekOrigin.Current);
-                        uint nextInst = br.PeekUInt32();
-                        // if the next instruction over is all 0's, this is definitely a tail call
-                        if (nextInst == 0) {
-                            break;
-                        }
-                        // if the next instruction over's addr == maxAddr, tail call
-                        else if(addr + 4 == maxAddr) {
-                            break;
-                        }
-                        // if the next instruction over's addr < highestAddr + 4, it's NOT a tail call
-                        // use addr + 4 for this
-                        else if (addr + 4 < highestAddr + 4) {
-                            // NOT a tail call, don't do anything
-                        }
-                        // if addr + 4 == highestAddr + 4 AND highestAddr + 4 is in the workList, don't mark it as a tail call, because we don't know for sure
-                        // explorer that inst first instead of coming to a concrete conclusion
-                        else if((addr + 4 == highestAddr + 4) && worklist.Contains(addr + 4)) {
-                            // we don't know for sure, so don't do anything
-                        }
-                        // if the target is part of a known, non-reg intrinsic function, tail call
-                        else if(GetFunctionFromBounds(target) != null && !GetFunctionFromBounds(target).IsRegIntrinsic()) {
-                            break;
-                        }
-                        // if the target is NOT part of a known function
-                        else if (GetFunctionFromBounds(target) == null) {
-                            // if the b target is past the known start addr of this func, definitely a tail call
-                            if (target < startAddr) {
-                                break;
-                            }
-                            // if the b target is at or past the known start addr of a later func, definitely a tail call
-                            if (target >= maxAddr) {
-                                break;
-                            }
-                        }
-                        else {
-                            //Console.WriteLine($"Branch at 0x{addr:X} might be a tail call!");
-                        }
-                    }
-                }
-
-                if (PPCHelper.IsBL(instr)) {
-                    worklist.Enqueue(addr + 4);
-                }
-                continue;
-            }
-
-            // if conditional branch (bc or bcl)
-            // TODO: add extra logic to check for bgt's to jump tables
-            if(PPCHelper.IsConditionalBranch(instr)) {
-                uint target = CalculateConditionalBranchTarget((uint)offset, instr);
-                if (target >= textSectionBegin && target > startAddr && target < maxAddr)
-                    worklist.Enqueue(target);
-
-                worklist.Enqueue(addr + 4); // fallthrough path
-                continue;
-            }
-
-            // this current inst ain't nothin special, just go ahead and add the next addr over
-            worklist.Enqueue(addr + 4);
-        }
-
-        //Console.WriteLine($"Func that starts at 0x{startAddr:X}, ends at 0x{highestAddr + 4:X}");
-        // now that we know where the end is, move the reader ahead up to that point
-        br.BaseStream.Seek(originalPos + (highestAddr + 4 - startAddr), SeekOrigin.Begin);
-        return highestAddr + 4;
-}
- 
- 
- 
- 
- 
- */
