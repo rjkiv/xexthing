@@ -281,7 +281,7 @@ class XexPE {
         // sweep for more start addresses using bl targets
         CreateSpeculativeFunctions();
         BreakFuncsDownIntoBlocks();
-        DumpFuncs(false);
+        DumpFuncs(true);
         VerifyAgainstPData();
     }
 

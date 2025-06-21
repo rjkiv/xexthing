@@ -2,7 +2,7 @@
   "profiles": {
     "XexTools": {
       "commandName": "Project",
-      "commandLineArgs": "\"D:\\DC3 Debug\\Gamepad\\Debug\""
+      "commandLineArgs": "\"D:\\DC3 Debug\\Gamepad\\Release\""
     }
   }
 }
